@@ -40,25 +40,42 @@ exports.adminLogin = async (req, res) => {
     }
 
     // Enforce single-browser for admin as well
-    if (admin.deviceId && effectiveDeviceId && admin.deviceId !== effectiveDeviceId) {
-      try {
-        await Notification.create({
-          title: 'محاولة دخول على حساب المدير من متصفح آخر',
-          recipients: [admin._id],
-        });
-      } catch (e) {
-        // ignore notification errors
+
+    // Support up to 2 admin devices: normalize legacy field to array
+    admin.deviceIds = Array.isArray(admin.deviceIds) && admin.deviceIds.length > 0
+      ? admin.deviceIds
+      : (admin.deviceId ? [admin.deviceId] : []);
+    admin.sessionTokens = Array.isArray(admin.sessionTokens) && admin.sessionTokens.length > 0
+      ? admin.sessionTokens
+      : (admin.sessionToken ? [admin.sessionToken] : []);
+
+    if (effectiveDeviceId) {
+      if (!admin.deviceIds.includes(effectiveDeviceId)) {
+        if (admin.deviceIds.length >= 2) {
+          try {
+            await Notification.create({
+              title: 'محاولة دخول على حساب المدير من متصفح آخر',
+              recipients: [admin._id],
+            });
+          } catch (e) {
+            // ignore notification errors
+          }
+          return res.status(403).json({ message: 'Admin already logged in on two other browsers' });
+        }
+        admin.deviceIds.push(effectiveDeviceId);
       }
-      return res.status(403).json({ message: 'Admin already logged in on another browser' });
     }
 
-    // Bind device and generate a fresh session token
+    // Bind device and generate a fresh session token (support multiple tokens for admin)
     const crypto = require('crypto');
     const newSessionToken = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+    admin.sessionTokens = admin.sessionTokens || [];
+    admin.sessionTokens.push(newSessionToken);
+    // keep sessionTokens size capped (2)
+    if (admin.sessionTokens.length > 2) admin.sessionTokens = admin.sessionTokens.slice(-2);
 
-    if (!admin.deviceId && effectiveDeviceId) {
-      admin.deviceId = effectiveDeviceId;
-    }
+    // keep legacy fields for backwards compat (first values)
+    if (!admin.deviceId && admin.deviceIds.length > 0) admin.deviceId = admin.deviceIds[0];
     admin.sessionToken = newSessionToken;
     try { await admin.save(); } catch (e) { /* non-fatal */ }
 
@@ -317,8 +334,15 @@ exports.resetDevice = async (req, res) => {
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    user.deviceId = null;
-    user.sessionToken = null; // invalidate existing session tokens
+    if (user.isAdmin) {
+      user.deviceIds = [];
+      user.sessionTokens = [];
+      user.deviceId = null;
+      user.sessionToken = null;
+    } else {
+      user.deviceId = null;
+      user.sessionToken = null; // invalidate existing session tokens
+    }
     await user.save();
 
     return res.json({ message: 'Device reset', user });

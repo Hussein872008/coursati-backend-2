@@ -355,3 +355,98 @@ exports.recordVideoView = async (req, res) => {
     return res.status(500).json({ message: err.message });
   }
 };
+
+// Stream a downloadable file by concatenating segments sequentially.
+// This lets the browser manage the download independently so refreshing
+// the original page doesn't cancel it. Requires auth + subscription.
+exports.download = async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const quality = req.query.quality || req.query.q;
+
+    // check permission: only admin or users allowed to download
+    const user = req.user;
+    if (!user) return res.status(401).json({ message: 'Unauthenticated' });
+    if (!user.isAdmin && !user.canDownloadVideos) return res.status(403).json({ message: 'Download not allowed' });
+
+    const video = await Video.findById(videoId);
+    if (!video) return res.status(404).json({ message: 'video not found' });
+    const q = video.qualities.find((x) => String(x.quality) === String(quality)) || video.qualities[0];
+    if (!q) return res.status(404).json({ message: 'quality not found' });
+
+    // Determine segment count
+    const segmentCount = (q.segmentCount && q.segmentCount > 1) ? q.segmentCount : estimateSegmentCountFromUrl(q.lastSegmentUrl || q.url || '');
+
+    // Prepare response headers for download
+    const rawTitle = (video && video.title) ? String(video.title) : 'video';
+    const asciiTitle = rawTitle.replace(/[^a-z0-9\-_. ]/gi, '_');
+    const qualityLabel = q.quality ? `${q.quality}p` : 'video';
+    const ext = '.ts';
+    const asciiFilename = `${asciiTitle}_${qualityLabel}${ext}`;
+    const utfFilename = `${rawTitle}_${qualityLabel}${ext}`;
+    res.setHeader('Content-Type', 'video/MP2T');
+    // Provide both ASCII fallback and RFC5987 UTF-8 filename*
+    try {
+      res.setHeader('Content-Disposition', `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(utfFilename)}`);
+    } catch (e) {
+      res.setHeader('Content-Disposition', `attachment; filename="${asciiFilename}"`);
+    }
+
+    // Stream segments sequentially
+    const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
+    const https = require('https');
+    const axiosConfigBase = { responseType: 'stream' };
+    if (allowInsecure) axiosConfigBase.httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+    for (let i = 1; i <= Math.max(1, segmentCount); i++) {
+      if (res.headersSent && res.writableEnded) break;
+      // build segment URL similar to proxy logic
+      const parts = (q.lastSegmentUrl || q.url || '').split('/');
+      const last = parts.pop();
+      const matches = [...last.matchAll(/\d+/g)];
+      let newLast = last;
+      if (matches && matches.length > 0) {
+        let best = matches[0];
+        for (const mmm of matches) if (parseInt(mmm[0],10) > parseInt(best[0],10)) best = mmm;
+        const digits = best[0];
+        const idx = best.index;
+        const padded = String(i).padStart(digits.length, '0');
+        newLast = last.slice(0, idx) + padded + last.slice(idx + digits.length);
+      } else {
+        const mm = last.match(/(\.[^.]+)$/);
+        if (mm) newLast = last.replace(mm[1], `_${i}${mm[1]}`);
+        else newLast = `${last}_${i}`;
+      }
+      parts.push(newLast);
+      const finalUrl = parts.join('/');
+
+      try {
+        const upstreamRes = await require('axios').get(finalUrl, axiosConfigBase);
+        // pipe upstream stream to client and wait until it finishes
+        await new Promise((resolve, reject) => {
+          upstreamRes.data.on('data', (chunk) => {
+            try { res.write(chunk); } catch (e) { /* client likely closed */ }
+          });
+          upstreamRes.data.on('end', resolve);
+          upstreamRes.data.on('error', reject);
+          // if client disconnects, stop streaming
+          req.on('close', () => {
+            try { if (upstreamRes.data && upstreamRes.data.destroy) upstreamRes.data.destroy(); } catch (e) {}
+            resolve();
+          });
+        });
+      } catch (err) {
+        console.error('[download] failed fetching segment', finalUrl, err && err.message);
+        // continue to next segment or break?
+        // We'll break to avoid delivering an incomplete file silently
+        break;
+      }
+    }
+
+    try { res.end(); } catch (e) {}
+    return;
+  } catch (err) {
+    console.error('download error', err && err.message);
+    try { if (!res.headersSent) res.status(500).json({ message: err.message }); } catch (e) {}
+  }
+};

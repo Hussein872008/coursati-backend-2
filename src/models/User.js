@@ -44,6 +44,16 @@ const userSchema = new mongoose.Schema(
         type: String,
         default: null,
       },
+      // Support multiple device ids for admins (allow up to 2)
+      deviceIds: {
+        type: [String],
+        default: [],
+      },
+      // Support multiple session tokens for multi-device sessions (admins)
+      sessionTokens: {
+        type: [String],
+        default: [],
+      },
   },
   { timestamps: true }
 );

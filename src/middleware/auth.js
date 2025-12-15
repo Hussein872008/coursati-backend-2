@@ -17,12 +17,21 @@ const authMiddleware = async (req, res, next) => {
     if (!user) {
       return res.status(401).json({ message: 'Invalid user code' });
     }
-    // if user is bound to a device, require matching device id
-    if (user.deviceId && deviceId && user.deviceId !== deviceId) {
+    // normalize device ids and session tokens (support legacy single-field)
+    const userDeviceIds = Array.isArray(user.deviceIds) && user.deviceIds.length > 0
+      ? user.deviceIds
+      : (user.deviceId ? [user.deviceId] : []);
+    const userSessionTokens = Array.isArray(user.sessionTokens) && user.sessionTokens.length > 0
+      ? user.sessionTokens
+      : (user.sessionToken ? [user.sessionToken] : []);
+
+    // If user has registered device ids, require the incoming deviceId to be one of them
+    if (userDeviceIds.length > 0 && deviceId && !userDeviceIds.includes(deviceId)) {
       return res.status(403).json({ message: 'Access denied: user bound to a different device' });
     }
-    // if user has a sessionToken, require matching token
-    if (user.sessionToken && sessionToken && user.sessionToken !== sessionToken) {
+
+    // If user has session tokens, require the incoming sessionToken to be one of them
+    if (userSessionTokens.length > 0 && sessionToken && !userSessionTokens.includes(sessionToken)) {
       return res.status(403).json({ message: 'Access denied: session invalidated' });
     }
     req.user = user;
@@ -45,6 +54,7 @@ const adminMiddleware = (req, res, next) => {
 const optionalAuth = async (req, res, next) => {
   const userCode = req.headers['user-code'];
   const deviceId = req.headers['device-id'] || req.headers['device_id'] || req.query.deviceId || req.query['device-id'];
+  const sessionToken = req.headers['session-token'] || req.headers['session_token'];
   if (!userCode) {
     return next();
   }
@@ -53,9 +63,16 @@ const optionalAuth = async (req, res, next) => {
   try {
     const user = await User.findOne({ code: userCode });
     if (user) {
-      if (user.deviceId && deviceId && user.deviceId !== deviceId) {
+      const userDeviceIds = Array.isArray(user.deviceIds) && user.deviceIds.length > 0
+        ? user.deviceIds
+        : (user.deviceId ? [user.deviceId] : []);
+      const userSessionTokens = Array.isArray(user.sessionTokens) && user.sessionTokens.length > 0
+        ? user.sessionTokens
+        : (user.sessionToken ? [user.sessionToken] : []);
+
+      if (userDeviceIds.length > 0 && deviceId && !userDeviceIds.includes(deviceId)) {
         // do not attach user if device doesn't match
-      } else if (user.sessionToken && sessionToken && user.sessionToken !== sessionToken) {
+      } else if (userSessionTokens.length > 0 && sessionToken && !userSessionTokens.includes(sessionToken)) {
         // do not attach user if session token invalid
       } else {
         req.user = user;

@@ -16,6 +16,9 @@ router.get('/:videoId/viewers', authMiddleware, adminMiddleware, videoController
 // Record a view for a specific video (requires subscription)
 router.post('/:videoId/view', authMiddleware, checkSubscription, videoController.recordVideoView);
 
+// Download assembled file (streams segments sequentially). Requires active session/subscription and download permission.
+router.get('/:videoId/download', authMiddleware, checkSubscription, videoController.download);
+
 // Sign a segment (requires auth + active subscription)
 router.post('/:videoId/sign', authMiddleware, checkSubscription, videoController.signSegment);
 
