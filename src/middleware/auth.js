@@ -1,0 +1,111 @@
+// Check if request has a valid user token
+const authMiddleware = async (req, res, next) => {
+  // allow user code to come from header or query param (for browser downloads)
+  const userCode = req.headers['user-code'] || req.query.userCode || req.query['user-code'];
+  // device id header used to enforce single-browser usage
+  const deviceId = req.headers['device-id'] || req.headers['device_id'] || req.query.deviceId || req.query['device-id'];
+  // session token header used to validate active session
+  const sessionToken = req.headers['session-token'] || req.headers['session_token'];
+  
+  if (!userCode) {
+    return res.status(401).json({ message: 'User code required' });
+  }
+
+  const User = require('../models/User');
+  try {
+    const user = await User.findOne({ code: userCode });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid user code' });
+    }
+    // if user is bound to a device, require matching device id
+    if (user.deviceId && deviceId && user.deviceId !== deviceId) {
+      return res.status(403).json({ message: 'Access denied: user bound to a different device' });
+    }
+    // if user has a sessionToken, require matching token
+    if (user.sessionToken && sessionToken && user.sessionToken !== sessionToken) {
+      return res.status(403).json({ message: 'Access denied: session invalidated' });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(500).json({ message: 'Auth error' });
+  }
+};
+
+
+// Check if user is admin
+const adminMiddleware = (req, res, next) => {
+  if (!req.user || !req.user.isAdmin) {
+    return res.status(403).json({ message: 'Admin access only' });
+  }
+  next();
+};
+
+// Optional auth: if `user-code` header present, set `req.user`; otherwise continue anonymously
+const optionalAuth = async (req, res, next) => {
+  const userCode = req.headers['user-code'];
+  const deviceId = req.headers['device-id'] || req.headers['device_id'] || req.query.deviceId || req.query['device-id'];
+  if (!userCode) {
+    return next();
+  }
+
+  const User = require('../models/User');
+  try {
+    const user = await User.findOne({ code: userCode });
+    if (user) {
+      if (user.deviceId && deviceId && user.deviceId !== deviceId) {
+        // do not attach user if device doesn't match
+      } else if (user.sessionToken && sessionToken && user.sessionToken !== sessionToken) {
+        // do not attach user if session token invalid
+      } else {
+        req.user = user;
+      }
+    }
+  } catch (error) {
+    // optionalAuth error (suppressed in production logs)
+  }
+  return next();
+};
+
+module.exports = {
+  authMiddleware,
+  adminMiddleware,
+  optionalAuth,
+};
+
+// Middleware to ensure the authenticated user's subscription/code is not expired
+const checkSubscription = (req, res, next) => {
+  try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ message: 'User required' });
+    }
+
+    // Permanent subscriptions always allowed
+    if (user.subscriptionType === 'permanent') {
+      return next();
+    }
+
+    // If there's no expiration date or it's in the past, deny access
+    if (!user.subscriptionExpires) {
+      return res.status(403).json({ message: 'Subscription expired' });
+    }
+
+    const now = new Date();
+    const expires = new Date(user.subscriptionExpires);
+    if (expires < now) {
+      return res.status(403).json({ message: 'Subscription expired' });
+    }
+
+    return next();
+  } catch (err) {
+    return res.status(500).json({ message: 'Subscription check error' });
+  }
+};
+
+module.exports = {
+  authMiddleware,
+  adminMiddleware,
+  optionalAuth,
+  checkSubscription,
+};
