@@ -233,7 +233,12 @@ exports.proxySegment = async (req, res) => {
         await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
       }
     }
-    console.error('[proxySegment] all attempts failed for', finalUrl, 'lastErr:', lastErr && lastErr.message);
+    console.error('[proxySegment] all attempts failed for', finalUrl, 'lastErr:', lastErr && (lastErr.message || lastErr));
+    // Provide additional diagnostic info in non-production to help debugging
+    if (String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+      const errMsg = lastErr && (lastErr.message || (lastErr.response && lastErr.response.statusText) || String(lastErr));
+      return res.status(502).json({ message: 'upstream fetch failed', url: finalUrl, error: errMsg });
+    }
     return res.status(502).send('upstream fetch failed');
   } catch (err) {
     console.error('proxySegment error', err && err.message ? err.message : err);

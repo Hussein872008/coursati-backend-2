@@ -57,20 +57,30 @@ app.use(
 // =====================
 // Body parsers
 // =====================
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // =====================
 // MongoDB Connection
 // =====================
+
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
     if (process.env.NODE_ENV !== 'production') {
       console.log('MongoDB connected');
     }
+
+    // Start server only after DB connected to avoid buffering timeouts
+    app.listen(PORT, () => {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`Server running on http://localhost:${PORT}`);
+      }
+    });
   })
-  .catch(() => {
+  .catch((err) => {
+    console.error('MongoDB connection failed', err && err.message);
     process.exit(1);
   });
 
@@ -124,11 +134,4 @@ app.use((req, res) => {
   res.status(404).json({ message: 'Not found' });
 });
 
-// =====================
-// Start Server
-// =====================
-app.listen(PORT, () => {
-  if (process.env.NODE_ENV !== 'production') {
-    console.log(`Server running on http://localhost:${PORT}`);
-  }
-});
+// Note: server starts after successful MongoDB connection above
