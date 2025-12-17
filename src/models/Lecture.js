@@ -11,6 +11,10 @@ const lectureSchema = new mongoose.Schema(
       ref: 'Chapter',
       required: true,
     },
+    // URL for lecture thumbnail (Cloudinary or external)
+    thumbnailUrl: { type: String },
+    // legacy field: allow storing direct thumbnail string if used elsewhere
+    thumbnail: { type: String },
     pdfs: [
       {
         url: { type: String },

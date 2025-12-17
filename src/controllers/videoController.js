@@ -6,6 +6,19 @@ const gridfs = require('../utils/gridfs');
 
 const signSecret = process.env.VIDEO_SIGN_SECRET || process.env.JWT_SECRET;
 
+function parseTtlToSeconds(ttl) {
+  if (!ttl) return 120;
+  if (typeof ttl === 'number') return Math.max(1, Math.floor(ttl));
+  if (typeof ttl === 'string') {
+    const s = ttl.trim();
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    if (s.endsWith('s')) return parseInt(s.slice(0, -1), 10) || 120;
+    if (s.endsWith('m')) return (parseInt(s.slice(0, -1), 10) || 2) * 60;
+    if (s.endsWith('h')) return (parseInt(s.slice(0, -1), 10) || 1) * 3600;
+  }
+  return 120;
+}
+
 // Simple in-memory playlist cache: { key: { expires: ts, body: string } }
 const playlistCache = new Map();
 
@@ -95,8 +108,10 @@ exports.signSegment = async (req, res) => {
     if (!quality || typeof segmentNumber === 'undefined') {
       return res.status(400).json({ message: 'quality and segmentNumber required' });
     }
-    const token = jwt.sign({ videoId, quality, segmentNumber }, signSecret, { expiresIn: '2m' });
-    return res.json({ token, expiresIn: 120 });
+    const ttl = process.env.VIDEO_SEGMENT_TOKEN_TTL || '2m';
+    const ttlSeconds = parseTtlToSeconds(ttl);
+    const token = jwt.sign({ videoId, quality, segmentNumber }, signSecret, { expiresIn: ttlSeconds });
+    return res.json({ token, expiresIn: ttlSeconds });
   } catch (err) {
     console.error('signSegment error', err);
     return res.status(500).json({ message: err.message });
@@ -125,9 +140,14 @@ exports.playlist = async (req, res) => {
     // Build m3u8
     const lines = ['#EXTM3U', '#EXT-X-VERSION:3', `#EXT-X-TARGETDURATION:${segDuration}`, '#EXT-X-MEDIA-SEQUENCE:1'];
 
+    // Decide per-segment token TTL. Ensure it's at least long enough to cover playlist playback plus a safety margin.
+    const configuredTtl = process.env.VIDEO_SEGMENT_TOKEN_TTL || '2m';
+    const configuredSeconds = parseTtlToSeconds(configuredTtl);
+    const playlistSeconds = Math.max(1, segDuration * segmentCount);
+    const segTtlSeconds = Math.max(configuredSeconds, playlistSeconds + 30);
     for (let i = 1; i <= segmentCount; i++) {
-      // shorter-lived tokens for playlist (2 minutes)
-      const token = jwt.sign({ videoId, quality, segmentNumber: i }, signSecret, { expiresIn: '2m' });
+      // sign tokens valid for segTtlSeconds
+      const token = jwt.sign({ videoId, quality, segmentNumber: i }, signSecret, { expiresIn: segTtlSeconds });
       const segUrl = `/api/videos/${videoId}/segments/${quality}/${i}?token=${encodeURIComponent(token)}`;
       lines.push(`#EXTINF:${segDuration},`);
       lines.push(segUrl);
@@ -154,12 +174,25 @@ exports.proxySegment = async (req, res) => {
     if (!token) return res.status(401).send('token required');
     let payload = null;
     try {
-      payload = jwt.verify(token, signSecret);
+      // allow small clock skew tolerance
+      payload = jwt.verify(token, signSecret, { clockTolerance: 5 });
     } catch (err) {
-      // token verify failed
+      // token verify failed -> provide diagnostics in non-production
+      const decoded = (() => {
+        try { return jwt.decode(token); } catch (e) { return null; }
+      })();
+      console.warn('[proxySegment] token verify failed', err && err.message, 'decoded:', decoded);
+      if (String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+        return res.status(403).json({ message: 'invalid token', error: err && err.message, decoded });
+      }
       return res.status(403).send('invalid token');
     }
     if (!payload || payload.videoId !== videoId || payload.quality !== quality || Number(payload.segmentNumber) !== Number(segmentNumber)) {
+      const decoded = jwt.decode(token);
+      console.warn('[proxySegment] token payload mismatch', { payload, expected: { videoId, quality, segmentNumber }, decoded });
+      if (String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+        return res.status(403).json({ message: 'invalid token', payload, expected: { videoId, quality, segmentNumber }, decoded });
+      }
       return res.status(403).send('invalid token');
     }
 
@@ -397,15 +430,9 @@ exports.download = async (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename="${asciiFilename}"`);
     }
 
-    // Stream segments sequentially
-    const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
-    const https = require('https');
-    const axiosConfigBase = { responseType: 'stream' };
-    if (allowInsecure) axiosConfigBase.httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
+    // Build final segment URLs first so we can optionally compute total size
+    const finalUrls = [];
     for (let i = 1; i <= Math.max(1, segmentCount); i++) {
-      if (res.headersSent && res.writableEnded) break;
-      // build segment URL similar to proxy logic
       const parts = (q.lastSegmentUrl || q.url || '').split('/');
       const last = parts.pop();
       const matches = [...last.matchAll(/\d+/g)];
@@ -423,10 +450,40 @@ exports.download = async (req, res) => {
         else newLast = `${last}_${i}`;
       }
       parts.push(newLast);
-      const finalUrl = parts.join('/');
+      finalUrls.push(parts.join('/'));
+    }
 
+    // Try to compute total length by doing HEAD requests for each segment (may fail)
+    let totalBytes = 0;
+    let canComputeTotal = true;
+    const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
+    const https = require('https');
+    const axiosConfigBase = {};
+    if (allowInsecure) axiosConfigBase.httpsAgent = new https.Agent({ rejectUnauthorized: false });
+    for (const u of finalUrls) {
       try {
-        const upstreamRes = await require('axios').get(finalUrl, axiosConfigBase);
+        const hres = await require('axios').head(u, axiosConfigBase);
+        const cl = hres.headers && (hres.headers['content-length'] || hres.headers['content-length'.toLowerCase()]);
+        const n = cl ? parseInt(cl, 10) : NaN;
+        if (isNaN(n)) { canComputeTotal = false; break; }
+        totalBytes += n;
+      } catch (e) {
+        canComputeTotal = false;
+        break;
+      }
+    }
+
+    if (canComputeTotal && totalBytes > 0) {
+      try { res.setHeader('Content-Length', String(totalBytes)); } catch (e) { }
+    }
+
+    // Stream segments sequentially
+    const axiosConfigStream = { responseType: 'stream' };
+    if (allowInsecure) axiosConfigStream.httpsAgent = new https.Agent({ rejectUnauthorized: false });
+    for (const finalUrl of finalUrls) {
+      if (res.headersSent && res.writableEnded) break;
+      try {
+        const upstreamRes = await require('axios').get(finalUrl, axiosConfigStream);
         // pipe upstream stream to client and wait until it finishes
         await new Promise((resolve, reject) => {
           upstreamRes.data.on('data', (chunk) => {
@@ -442,8 +499,6 @@ exports.download = async (req, res) => {
         });
       } catch (err) {
         console.error('[download] failed fetching segment', finalUrl, err && err.message);
-        // continue to next segment or break?
-        // We'll break to avoid delivering an incomplete file silently
         break;
       }
     }

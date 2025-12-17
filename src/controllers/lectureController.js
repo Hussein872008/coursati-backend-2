@@ -41,6 +41,11 @@ exports.createLecture = async (req, res) => {
       }
     }
 
+    // If client provided a direct thumbnail URL (e.g. uploaded to Cloudinary from frontend), use it
+    if (!finalThumbnailUrl && req.body && req.body.thumbnailUrl) {
+      finalThumbnailUrl = req.body.thumbnailUrl;
+    }
+
     const parsedOrder = (() => {
       const n = parseInt(order, 10);
       return Number.isNaN(n) ? 0 : n;
@@ -188,6 +193,11 @@ exports.updateLecture = async (req, res) => {
           fs.unlinkSync(file.path);
         }
       }
+    }
+
+    // If client provided a direct thumbnail URL, prefer it when no file was uploaded
+    if (!file && req.body && req.body.thumbnailUrl) {
+      finalThumbnailUrl = req.body.thumbnailUrl;
     }
 
     const parsedOrder = (() => {

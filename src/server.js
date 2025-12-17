@@ -54,6 +54,12 @@ app.use(
   })
 );
 
+// Expose certain headers to the browser (so frontend can read Content-Length / Content-Disposition)
+app.use((req, res, next) => {
+  res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
+  next();
+});
+
 // =====================
 // Body parsers
 // =====================
