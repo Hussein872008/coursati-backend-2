@@ -44,3 +44,20 @@ exports.markAsRead = async (req, res) => {
     return res.status(500).json({ message: err.message });
   }
 };
+
+// Mark all notifications as read for the authenticated user
+exports.markAllRead = async (req, res) => {
+  try {
+    const userId = req.user?._id;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+    // Add userId to readBy for all notifications that don't already contain it
+    await Notification.updateMany(
+      { readBy: { $ne: userId } },
+      { $addToSet: { readBy: userId } }
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('markAllRead error', err);
+    return res.status(500).json({ message: err.message });
+  }
+};

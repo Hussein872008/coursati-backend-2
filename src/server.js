@@ -17,6 +17,7 @@ const uploadsRoutes = require('./routes/uploadsRoutes');
 const treeRoutes = require('./routes/treeRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const notificationsRoutes = require('./routes/notificationsRoutes');
+const searchRoutes = require('./routes/searchRoutes');
 
 // Middleware
 const { authMiddleware, optionalAuth } = require('./middleware/auth');
@@ -71,6 +72,8 @@ app.use(express.urlencoded({ extended: true }));
 // MongoDB Connection
 // =====================
 
+
+
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
@@ -95,6 +98,9 @@ mongoose
 // =====================
 app.use('/auth', authRoutes);
 app.use('/api/tree', treeRoutes);
+
+// Global search (optional auth)
+app.use('/api/search', optionalAuth, searchRoutes);
 
 // =====================
 // Protected Routes
