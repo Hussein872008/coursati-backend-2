@@ -141,24 +141,86 @@ exports.updateMaterial = async (req, res) => {
 
     let finalThumbnailUrl = material.thumbnailUrl;
     let finalThumbnailPublicId = material.thumbnailPublicId;
+    const file = req.file;
 
-    // If new thumbnail URL is provided, upload to Cloudinary
-    if (thumbnailUrl && thumbnailUrl !== material.thumbnailUrl) {
+    // DEBUG: log incoming update info to help diagnose upload/delete issues
+    try {
+      console.log(`updateMaterial: id=${req.params.id} hasFile=${!!req.file} thumbnailUrlType=${typeof thumbnailUrl}`);
+    } catch (e) {}
+
+    // Case A: new file uploaded via multipart/form-data (multer -> req.file)
+    if (file) {
+      try {
+        const uploadResult = await uploadImage(
+          file.path,
+          'coursati/materials',
+          `material_${req.params.id}`
+        );
+
+        // remove temp file
+        if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+
+        if (uploadResult.success) {
+          // delete previous cloud asset if present
+          if (material.thumbnailPublicId) {
+            try {
+              console.log(`updateMaterial: deleting previous publicId=${material.thumbnailPublicId}`);
+              await deleteFile(material.thumbnailPublicId);
+            } catch (e) {
+              console.error('updateMaterial: failed deleting previous publicId', e?.message || e);
+            }
+          }
+
+          finalThumbnailUrl = uploadResult.url;
+          finalThumbnailPublicId = uploadResult.public_id;
+        } else {
+          return res.status(400).json({
+            message: 'Failed to upload thumbnail',
+            error: uploadResult.error,
+          });
+        }
+      } catch (e) {
+        // cleanup temp file on unexpected error
+        if (file && file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+        throw e;
+      }
+    } else if (typeof thumbnailUrl !== 'undefined' && (thumbnailUrl === null || thumbnailUrl === '')) {
+      // Case B: explicit removal of thumbnail (thumbnailUrl null/empty sent)
+      if (material.thumbnailPublicId) {
+        try {
+          console.log(`updateMaterial: explicit removal deleting publicId=${material.thumbnailPublicId}`);
+          await deleteFile(material.thumbnailPublicId);
+        } catch (e) {
+          console.error('updateMaterial: failed deleting previous publicId on removal', e?.message || e);
+        }
+      } else if (material.thumbnailUrl) {
+        const { getPublicIdFromUrl } = require('../utils/cloudinaryUploader');
+        const publicId = getPublicIdFromUrl(material.thumbnailUrl);
+        if (publicId) {
+          try { console.log(`updateMaterial: explicit removal deleting extracted publicId=${publicId}`); await deleteFile(publicId); } catch (e) { console.error('updateMaterial: failed deleting extracted publicId', e?.message || e); }
+        }
+      }
+
+      finalThumbnailUrl = null;
+      finalThumbnailPublicId = null;
+    } else if (thumbnailUrl && thumbnailUrl !== material.thumbnailUrl) {
+      // Case C: thumbnail replaced by a URL string -> upload from URL
       const uploadResult = await uploadImage(
         thumbnailUrl,
         'coursati/materials',
         `material_${req.params.id}`
       );
 
-        if (uploadResult.success) {
+      if (uploadResult.success) {
         // delete previous cloud asset if present
         if (material.thumbnailPublicId) {
-          try { await deleteFile(material.thumbnailPublicId); } catch (e) { /* suppressed delete warning */ }
+          try { await deleteFile(material.thumbnailPublicId); } catch (e) { console.error('updateMaterial: failed deleting previous after URL upload', e?.message || e); }
         }
 
         finalThumbnailUrl = uploadResult.url;
         finalThumbnailPublicId = uploadResult.public_id;
       } else {
+        console.error('updateMaterial: upload from URL failed', uploadResult.error);
         return res.status(400).json({
           message: 'Failed to upload thumbnail',
           error: uploadResult.error,

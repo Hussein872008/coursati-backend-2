@@ -13,6 +13,8 @@ router.get('/:videoId/playlist/:quality.m3u8', authMiddleware, checkSubscription
 
 // Admin: list viewers for a video
 router.get('/:videoId/viewers', authMiddleware, adminMiddleware, videoController.getVideoViewers);
+// Admin: delete a video
+router.delete('/:videoId', authMiddleware, adminMiddleware, videoController.deleteVideo);
 // Record a view for a specific video (requires subscription)
 router.post('/:videoId/view', authMiddleware, checkSubscription, videoController.recordVideoView);
 

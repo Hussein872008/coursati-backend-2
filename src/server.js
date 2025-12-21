@@ -72,8 +72,6 @@ app.use(express.urlencoded({ extended: true }));
 // MongoDB Connection
 // =====================
 
-
-
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {

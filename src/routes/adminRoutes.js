@@ -15,4 +15,6 @@ router.post('/lectures/:lectureId/videos', authMiddleware, adminMiddleware, vide
 
 // Admin: validate or mirror segments for a video
 router.post('/videos/:videoId/validate', authMiddleware, adminMiddleware, videoController.validateVideo);
+// Admin: update video metadata
+router.put('/videos/:videoId', authMiddleware, adminMiddleware, videoController.updateVideo);
 module.exports = router;

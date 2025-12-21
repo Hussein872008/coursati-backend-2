@@ -364,6 +364,81 @@ exports.getVideoViewers = async (req, res) => {
   }
 };
 
+// Admin: delete a video and unlink from lecture
+exports.deleteVideo = async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    if (!videoId) return res.status(400).json({ message: 'videoId required' });
+    const VideoModel = require('../models/Video');
+    const LectureModel = require('../models/Lecture');
+
+    const video = await VideoModel.findById(videoId);
+    if (!video) return res.status(404).json({ message: 'video not found' });
+
+    // remove video doc
+    await VideoModel.findByIdAndDelete(videoId);
+
+    // remove reference from lecture.videos array if present
+    try {
+      await LectureModel.findByIdAndUpdate(video.lectureId, { $pull: { videos: { id: videoId } } });
+    } catch (e) {
+      // non-fatal
+      console.warn('Failed to unlink video from lecture', e && e.message);
+    }
+
+    // best-effort cleanup: remove VideoView entries
+    try {
+      const VideoView = require('../models/VideoView');
+      await VideoView.deleteMany({ videoId });
+    } catch (e) {
+      // ignore
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('deleteVideo error', err && err.message ? err.message : err);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+// Admin: update video metadata (title, duration, qualities)
+exports.updateVideo = async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { title, duration, qualities } = req.body;
+    const VideoModel = require('../models/Video');
+
+    if (!videoId) return res.status(400).json({ message: 'videoId required' });
+
+    let parsedQualities = undefined;
+    if (typeof qualities !== 'undefined') {
+      try {
+        parsedQualities = typeof qualities === 'string' ? JSON.parse(qualities) : qualities;
+      } catch (err) {
+        return res.status(400).json({ message: 'Invalid qualities JSON' });
+      }
+      // normalize qualities shape
+      parsedQualities = parsedQualities.map((q) => ({
+        quality: String(q.quality || q.q || ''),
+        lastSegmentUrl: q.lastSegmentUrl || q.last_segment_url || q.url || '',
+        segmentCount: q.segmentCount || q.segment_count || undefined,
+      }));
+    }
+
+    const update = {};
+    if (typeof title !== 'undefined') update.title = title;
+    if (typeof duration !== 'undefined') update.duration = Number(duration) || 0;
+    if (typeof parsedQualities !== 'undefined') update.qualities = parsedQualities;
+
+    const updated = await VideoModel.findByIdAndUpdate(videoId, update, { new: true });
+    if (!updated) return res.status(404).json({ message: 'video not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('updateVideo error', err);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
 // Record a view for a specific video (user must be authenticated and have subscription)
 exports.recordVideoView = async (req, res) => {
   try {
