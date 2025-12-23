@@ -72,6 +72,7 @@ app.use(express.urlencoded({ extended: true }));
 // MongoDB Connection
 // =====================
 
+
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
@@ -143,5 +144,6 @@ app.use((err, req, res, next) => {
 app.use((req, res) => {
   res.status(404).json({ message: 'Not found' });
 });
+
 
 // Note: server starts after successful MongoDB connection above
