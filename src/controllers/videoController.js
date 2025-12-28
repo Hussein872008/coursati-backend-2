@@ -1,5 +1,7 @@
 const Video = require('../models/Video');
 const Lecture = require('../models/Lecture');
+const Chapter = require('../models/Chapter');
+const Notification = require('../models/Notification');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
 const gridfs = require('../utils/gridfs');
@@ -101,6 +103,55 @@ exports.getVideosByLecture = async (req, res) => {
   }
 };
 
+// Public: quick availability check for a lecture's videos.
+// Returns { ok:true, total, broken, perVideo: [{ videoId, available }] }
+exports.getLectureAvailabilityPublic = async (req, res) => {
+  try {
+    const { lectureId } = req.params;
+    const videos = await Video.find({ lectureId }).sort({ createdAt: 1 });
+    const https = require('https');
+    const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
+    const baseCfg = {};
+    if (allowInsecure) baseCfg.httpsAgent = new https.Agent({ rejectUnauthorized: false });
+    const AXIOS_TIMEOUT = parseInt(process.env.VIDEO_VALIDATE_TIMEOUT_MS || '3000', 10);
+
+    const results = [];
+    const CONCURRENCY = 6;
+    for (let i = 0; i < videos.length; i += CONCURRENCY) {
+      const batch = videos.slice(i, i + CONCURRENCY);
+      const promises = batch.map(async (v) => {
+        const q = (Array.isArray(v.qualities) && v.qualities[0]) || null;
+        const url = q && (q.lastSegmentUrl || q.url);
+        if (!url) return { videoId: v._id, available: false };
+        try {
+          const cfg = { ...baseCfg, timeout: AXIOS_TIMEOUT };
+          try {
+            const head = await axios.head(url, cfg);
+            if (head && head.status && head.status < 400) return { videoId: v._id, available: true };
+          } catch (he) {
+            // fall through to GET
+          }
+          const getcfg = { ...baseCfg, timeout: AXIOS_TIMEOUT, responseType: 'arraybuffer' };
+          const g = await axios.get(url, getcfg);
+          if (g && g.status && g.status < 400) return { videoId: v._id, available: true };
+        } catch (err) {
+          // unavailable
+        }
+        return { videoId: v._id, available: false };
+      });
+      const settled = await Promise.all(promises);
+      results.push(...settled);
+    }
+
+    const total = results.length;
+    const broken = results.filter((r) => !r.available).length;
+    return res.json({ ok: true, total, broken, perVideo: results });
+  } catch (err) {
+    console.error('getLectureAvailabilityPublic error', err && (err.stack || err.message));
+    return res.status(500).json({ message: 'availability check failed' });
+  }
+};
+
 // Sign a single segment request (short lived token)
 exports.signSegment = async (req, res) => {
   try {
@@ -134,23 +185,57 @@ exports.playlist = async (req, res) => {
     const q = video.qualities.find((x) => String(x.quality) === String(quality));
     if (!q) return res.status(404).send('quality not found');
 
-    // Prefer stored segmentCount if > 1, otherwise try to estimate from lastSegmentUrl
-    const segmentCount = (q.segmentCount && q.segmentCount > 1) ? q.segmentCount : estimateSegmentCountFromUrl(q.lastSegmentUrl || q.last_segment_url || q.url || '');
-    const segDuration = Math.max(1, Math.round((video.duration || 0) / Math.max(1, segmentCount)));
+    // Determine segmentCount with priority:
+    // 1) explicit q.segmentCount (>1)
+    // 2) estimate from lastSegmentUrl if it looks correct
+    // 3) derive from stored video.duration using a default segment length
+    const vidDuration = Number(video.duration) || 0;
+    const defaultSegLen = Number(process.env.DEFAULT_SEGMENT_DURATION || 6); // seconds per segment when deriving from duration
+    let segmentCount = (q.segmentCount && q.segmentCount > 1) ? q.segmentCount : 0;
+    if (!segmentCount) {
+      const est = estimateSegmentCountFromUrl(q.lastSegmentUrl || q.last_segment_url || q.url || '');
+      if (est && est > 1) segmentCount = est;
+    }
+    if ((!segmentCount || segmentCount < 1) && vidDuration > 0) {
+      segmentCount = Math.max(1, Math.ceil(vidDuration / Math.max(1, defaultSegLen)));
+    }
+    if (!segmentCount || segmentCount < 1) segmentCount = 1;
+
+    // Build per-segment durations using the canonical video duration from DB when available.
+    // This produces EXTINF values that sum to the known duration (with 3-decimal precision) and
+    // sets EXT-X-TARGETDURATION to the ceiling of the longest segment.
+    const segmentDurations = [];
+    if (vidDuration > 0 && segmentCount > 0) {
+      const per = vidDuration / segmentCount;
+      for (let i = 0; i < segmentCount; i++) segmentDurations.push(Number(per.toFixed(3)));
+      // adjust last segment to make the sum equal to vidDuration (prevent tiny rounding drift)
+      const sum = segmentDurations.reduce((a, b) => a + b, 0);
+      const diff = Number((vidDuration - sum).toFixed(3));
+      if (Math.abs(diff) > 0.0005) {
+        segmentDurations[segmentCount - 1] = Number((segmentDurations[segmentCount - 1] + diff).toFixed(3));
+      }
+    } else {
+      // fallback: 1s segments
+      for (let i = 0; i < Math.max(1, segmentCount); i++) segmentDurations.push(1);
+    }
+
+    const maxSegDur = Math.max(...segmentDurations, 1);
+    const targetDur = Math.ceil(maxSegDur);
 
     // Build m3u8
-    const lines = ['#EXTM3U', '#EXT-X-VERSION:3', `#EXT-X-TARGETDURATION:${segDuration}`, '#EXT-X-MEDIA-SEQUENCE:1'];
+    const lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-PLAYLIST-TYPE:VOD', `#EXT-X-TARGETDURATION:${targetDur}`, '#EXT-X-MEDIA-SEQUENCE:1'];
 
     // Decide per-segment token TTL. Ensure it's at least long enough to cover playlist playback plus a safety margin.
     const configuredTtl = process.env.VIDEO_SEGMENT_TOKEN_TTL || '2m';
     const configuredSeconds = parseTtlToSeconds(configuredTtl);
-    const playlistSeconds = Math.max(1, segDuration * segmentCount);
+    const playlistSeconds = Math.max(1, Math.ceil(vidDuration) || (targetDur * segmentCount));
     const segTtlSeconds = Math.max(configuredSeconds, playlistSeconds + 30);
     for (let i = 1; i <= segmentCount; i++) {
       // sign tokens valid for segTtlSeconds
       const token = jwt.sign({ videoId, quality, segmentNumber: i }, signSecret, { expiresIn: segTtlSeconds });
       const segUrl = `/api/videos/${videoId}/segments/${quality}/${i}?token=${encodeURIComponent(token)}`;
-      lines.push(`#EXTINF:${segDuration},`);
+      const dur = segmentDurations[i - 1] || 1;
+      lines.push(`#EXTINF:${dur},`);
       lines.push(segUrl);
     }
 
@@ -159,8 +244,20 @@ exports.playlist = async (req, res) => {
     const body = lines.join('\n');
     // cache briefly
     setPlaylistCache(cacheKey, body, 20);
-    res.setHeader('content-type', 'application/vnd.apple.mpegurl');
-    return res.send(body);
+    // expose video duration and playlist total for debugging (helps verify DB value is used)
+    try {
+      res.setHeader('x-video-duration', String(vidDuration));
+      const totalFromSegments = segmentDurations.reduce((a, b) => a + b, 0);
+      res.setHeader('x-playlist-total-seconds', String(Number(totalFromSegments.toFixed(3))));
+      // prepend a comment to the playlist body with debug info (players ignore comments)
+      const debugComment = `# DB_DURATION:${vidDuration} TOTAL_SEGMENTS_SUM:${Number(totalFromSegments.toFixed(3))}`;
+      const bodyWithComment = debugComment + '\n' + body;
+      res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+      return res.send(bodyWithComment);
+    } catch (e) {
+      res.setHeader('content-type', 'application/vnd.apple.mpegurl');
+      return res.send(body);
+    }
   } catch (err) {
     console.error('playlist error', err);
     return res.status(500).send('playlist error');
@@ -296,31 +393,58 @@ exports.validateVideo = async (req, res) => {
   }
 };
 
+// Admin: update video metadata (title, duration)
+exports.updateVideo = async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { title, duration } = req.body || {};
+    const update = {};
+    if (typeof title !== 'undefined') update.title = title;
+    if (typeof duration !== 'undefined') update.duration = Number(duration) || 0;
+    const video = await Video.findByIdAndUpdate(videoId, update, { new: true });
+    if (!video) return res.status(404).json({ message: 'video not found' });
+    return res.json(video);
+  } catch (err) {
+    console.error('updateVideo error', err && err.message);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+
 // Helper to validate a single video's segments. Returns object mapping quality -> [{segment, ok, ...}]
 // validateVideoSegments(video, mirror, allowFullCheck = true)
 // - if allowFullCheck is false, only try the stored lastSegmentUrl once and throw on failure
-async function validateVideoSegments(video, mirror, allowFullCheck = true) {
+// options: { signal: AbortSignal }
+async function validateVideoSegments(video, mirror, allowFullCheck = true, options = {}) {
   const results = {};
+  const MAX_SEGMENTS = parseInt(process.env.VIDEO_VALIDATE_MAX_SEGMENTS || '300', 10);
+  const CONCURRENCY = parseInt(process.env.VIDEO_VALIDATE_CONCURRENCY || '6', 10);
+  const AXIOS_TIMEOUT = parseInt(process.env.VIDEO_VALIDATE_TIMEOUT_MS || '5000', 10);
+
+  const axios = require('axios');
+  const https = require('https');
+  const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
+  const baseCfg = {};
+  if (allowInsecure) baseCfg.httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
   for (const q of video.qualities) {
     results[q.quality] = [];
+
     // Quick check: try the stored lastSegmentUrl (or url) once and short-circuit if it responds OK.
     const lastBase = q.lastSegmentUrl || q.url || '';
     if (lastBase) {
       try {
-        const axios = require('axios');
-        const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
-        const https = require('https');
-        const cfg = {};
-        if (allowInsecure) cfg.httpsAgent = new https.Agent({ rejectUnauthorized: false });
-        // HEAD preferred; if not allowed try GET
+        const cfg = { ...baseCfg, timeout: AXIOS_TIMEOUT };
+        if (options && options.signal) cfg.signal = options.signal;
         const resp = await axios.head(lastBase, cfg).catch(async (e) => {
           return axios.get(lastBase, { ...cfg, responseType: 'arraybuffer' }).then(r => r).catch((err) => { throw err; });
         });
-        // success — treat the quality as OK based on last-segment URL
-        results[q.quality].push({ segment: 'last', ok: true, status: resp.status || 200, url: lastBase });
+        results[q.quality].push({ segment: 'last', ok: true, status: resp.status || 200, url: lastBase, note: 'lastSegment quick check' });
         if (mirror) {
           try {
-            const r2 = await axios.get(lastBase, { ...(cfg || {}), responseType: 'stream' });
+            const r2cfg = { ...baseCfg, responseType: 'stream', timeout: AXIOS_TIMEOUT };
+            if (options && options.signal) r2cfg.signal = options.signal;
+            const r2 = await axios.get(lastBase, r2cfg);
             const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, 'last', r2.data, r2.headers['content-type'] || 'application/octet-stream');
             results[q.quality][results[q.quality].length-1].mirrored = `gridfs://${upload.filename}`;
           } catch (e) {
@@ -332,19 +456,42 @@ async function validateVideoSegments(video, mirror, allowFullCheck = true) {
         continue;
       } catch (err) {
         // last-segment check failed
+        // If upstream returned a permanent-not-found (410) or 404, treat as terminal
+        const status = err && err.response && err.response.status;
+        if (status === 410 || status === 404) {
+          const e = new Error(`last-segment check returned ${status} for quality=${q.quality}`);
+          e.original = err;
+          e.terminal = true;
+          throw e;
+        }
         if (!allowFullCheck) {
           // caller asked not to perform full per-segment checks — propagate error so caller can retry/fail
-          throw err;
+          const e = new Error(`last-segment check failed for quality=${q.quality}: ${err && (err.message || String(err))}`);
+          e.original = err;
+          throw e;
         }
         // otherwise fall back to full per-segment check
       }
     }
 
-    // fallback: check per-segment (original behavior)
-    const segmentCount = (q.segmentCount && q.segmentCount > 1) ? q.segmentCount : estimateSegmentCountFromUrl(q.lastSegmentUrl || q.url || '');
-    for (let i = 1; i <= segmentCount; i++) {
-      // build final upstream URL same as proxy logic
-      const parts = (q.lastSegmentUrl || q.url).split('/');
+    // fallback: check per-segment
+    let segmentCount = (q.segmentCount && q.segmentCount > 1) ? q.segmentCount : estimateSegmentCountFromUrl(q.lastSegmentUrl || q.url || '');
+    if (!segmentCount || segmentCount < 1) {
+      const vidDuration = Number(video.duration) || 0;
+      const defaultSegLen = Number(process.env.DEFAULT_SEGMENT_DURATION || 6);
+      if (vidDuration > 0) segmentCount = Math.max(1, Math.ceil(vidDuration / Math.max(1, defaultSegLen)));
+      else segmentCount = 1;
+    }
+
+    // enforce max limit to avoid runaway scans
+    if (segmentCount > MAX_SEGMENTS) segmentCount = MAX_SEGMENTS;
+
+    const segments = [];
+    for (let i = 1; i <= segmentCount; i++) segments.push(i);
+
+    // helper to build final URL for a given index
+    function buildUrlForIndex(idx) {
+      const parts = (q.lastSegmentUrl || q.url || '').split('/');
       const last = parts.pop();
       const matches = [...last.matchAll(/\d+/g)];
       let newLast = last;
@@ -352,43 +499,50 @@ async function validateVideoSegments(video, mirror, allowFullCheck = true) {
         let best = matches[0];
         for (const mmm of matches) if (parseInt(mmm[0],10) > parseInt(best[0],10)) best = mmm;
         const digits = best[0];
-        const idx = best.index;
-        const padded = String(i).padStart(digits.length, '0');
-        newLast = last.slice(0, idx) + padded + last.slice(idx + digits.length);
+        const idxPos = best.index;
+        const padded = String(idx).padStart(digits.length, '0');
+        newLast = last.slice(0, idxPos) + padded + last.slice(idxPos + digits.length);
       } else {
         const mm = last.match(/(\.[^.]+)$/);
-        if (mm) newLast = last.replace(mm[1], `_${i}${mm[1]}`);
-        else newLast = `${last}_${i}`;
+        if (mm) newLast = last.replace(mm[1], `_${idx}${mm[1]}`);
+        else newLast = `${last}_${idx}`;
       }
       parts.push(newLast);
-      const finalUrl = parts.join('/');
+      return { url: parts.join('/'), filename: newLast };
+    }
 
-      try {
-        const axios = require('axios');
-        const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
-        const https = require('https');
-        const cfg = {};
-        if (allowInsecure) cfg.httpsAgent = new https.Agent({ rejectUnauthorized: false });
-        const resp = await axios.head(finalUrl, cfg).catch(async (e) => {
-          // try GET if HEAD not allowed
-          return axios.get(finalUrl, { ...cfg, responseType: 'arraybuffer' }).then(r=>r).catch((err)=>{ throw err; });
-        });
-        results[q.quality].push({ segment: i, ok: true, status: resp.status || 200, url: finalUrl });
-
-        
-        if (mirror) {
-          try {
-            const r2 = await axios.get(finalUrl, { ...(cfg || {}), responseType: 'stream' });
-            const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, i, r2.data, r2.headers['content-type'] || 'application/octet-stream');
-            results[q.quality][results[q.quality].length-1].mirrored = `gridfs://${upload.filename}`;
-          } catch (e) {
-            results[q.quality][results[q.quality].length-1].mirrored = null;
-            results[q.quality][results[q.quality].length-1].mirrorError = e && e.message;
+    // process in batches with limited concurrency
+    for (let start = 0; start < segments.length; start += CONCURRENCY) {
+      const batch = segments.slice(start, start + CONCURRENCY);
+      const promises = batch.map(async (i) => {
+        const { url: finalUrl, filename: newLast } = buildUrlForIndex(i);
+        try {
+          const cfg = { ...baseCfg, timeout: AXIOS_TIMEOUT };
+          if (options && options.signal) cfg.signal = options.signal;
+          const resp = await axios.head(finalUrl, cfg).catch(async (e) => {
+            return axios.get(finalUrl, { ...cfg, responseType: 'arraybuffer' }).then(r=>r).catch((err)=>{ throw err; });
+          });
+          const rec = { segment: i, ok: true, status: resp.status || 200, url: finalUrl };
+          if (mirror) {
+            try {
+              const r2cfg = { ...baseCfg, responseType: 'stream', timeout: AXIOS_TIMEOUT };
+              if (options && options.signal) r2cfg.signal = options.signal;
+              const r2 = await axios.get(finalUrl, r2cfg);
+              const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, i, r2.data, r2.headers['content-type'] || 'application/octet-stream');
+              rec.mirrored = `gridfs://${upload.filename}`;
+            } catch (e) {
+              rec.mirrored = null;
+              rec.mirrorError = e && e.message;
+            }
           }
+          return rec;
+        } catch (err) {
+          return { segment: i, ok: false, error: err && (err.message || String(err)), url: finalUrl };
         }
-      } catch (err) {
-        results[q.quality].push({ segment: i, ok: false, error: err && err.message, url: finalUrl });
-      }
+      });
+
+      const settled = await Promise.all(promises);
+      results[q.quality].push(...settled);
     }
   }
   return results;
@@ -398,6 +552,16 @@ exports._validateVideoSegments = validateVideoSegments;
 
 // Simple in-memory job manager for validation jobs
 const validationJobs = new Map();
+
+// Helper: check if any validation job is currently running
+function hasRunningValidation() {
+  for (const v of validationJobs.values()) {
+    if (v && v.status === 'running') return true;
+  }
+  return false;
+}
+
+exports._hasRunningValidation = hasRunningValidation;
 
 function createJobRecord() {
   return {
@@ -441,6 +605,8 @@ exports.startValidateAllVideos = async (req, res) => {
         await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { totalVideos: inMemory.totalVideos } });
 
         console.log(`[validate-job ${jobDoc.id}] started - total videos: ${inMemory.totalVideos}`);
+        const PER_VIDEO_TIMEOUT_MS = parseInt(process.env.VIDEO_PER_VIDEO_TIMEOUT_MS || '120000', 10);
+
         for (const v of videos) {
           // honor pause requests
           while (true) {
@@ -458,27 +624,87 @@ exports.startValidateAllVideos = async (req, res) => {
           validationJobs.set(jobDoc.id, latestJob);
           await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { currentVideo: latestJob.currentVideo } });
 
+          // insert a placeholder result so frontends can show this video as 'in-progress'
+          try {
+            latestJob.videos = latestJob.videos || [];
+            const placeholder = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: undefined, startedAt: new Date() };
+            latestJob.videos.push(placeholder);
+            latestJob.processedVideos = latestJob.videos.length;
+            await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+            validationJobs.set(jobDoc.id, latestJob);
+          } catch (e) {
+            // non-fatal
+          }
+
           // perform per-video validation with limited retries (2 attempts)
           const maxAttempts = 2;
           let attempt = 0;
           let ok = false;
           let lastErr = null;
-          for (; attempt < maxAttempts; attempt++) {
+
+          // perform attempts but enforce a per-video deadline to avoid runaway processing
+          const startTs = Date.now();
+          const deadline = startTs + PER_VIDEO_TIMEOUT_MS;
+          while (attempt < maxAttempts) {
+            if (Date.now() > deadline) {
+              lastErr = lastErr || new Error('video-validation-timeout');
+              console.error(`[validate-job ${jobDoc.id}] video ${v._id} timed out after ${PER_VIDEO_TIMEOUT_MS}ms`);
+              break;
+            }
             try {
               console.log(`[validate-job ${jobDoc.id}] video ${v._id} attempt ${attempt+1}`);
-              // Only perform a fast check (last-segment) during job attempts — avoid full per-segment scans
-              const results = await validateVideoSegments(v, !!mirror, false);
+              const allowFull = (attempt === maxAttempts - 1);
+              // create abort controller that will fire at the deadline to cancel axios requests
+              let controller = null;
+              let abortTimer = null;
+              try {
+                if (typeof AbortController !== 'undefined') {
+                  controller = new AbortController();
+                  const remaining = Math.max(1000, deadline - Date.now());
+                  abortTimer = setTimeout(() => {
+                    try { controller.abort(); } catch (e) {}
+                  }, remaining);
+                }
+              } catch (e) {
+                controller = null;
+              }
+
+              const perAttemptTimeout = Math.max(1000, deadline - Date.now());
+              let results;
+              try {
+                results = await Promise.race([
+                  validateVideoSegments(v, !!mirror, allowFull, { signal: controller ? controller.signal : undefined }),
+                  new Promise((_, rej) => setTimeout(() => rej(new Error('validate-attempt-timeout')), perAttemptTimeout)),
+                ]);
+              } finally {
+                if (abortTimer) clearTimeout(abortTimer);
+              }
               const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: true, results, processedAt: new Date() };
-              latestJob.videos = latestJob.videos || [];
-              latestJob.videos.push(rec);
-              latestJob.processedVideos = latestJob.videos.length;
-              await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+              try {
+                latestJob.videos = latestJob.videos || [];
+                const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
+                if (idx >= 0) {
+                  latestJob.videos[idx] = rec;
+                } else {
+                  latestJob.videos.push(rec);
+                }
+                latestJob.processedVideos = latestJob.videos.length;
+                await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+                validationJobs.set(jobDoc.id, latestJob);
+              } catch (e) {}
               console.log(`[validate-job ${jobDoc.id}] video ${v._id} OK on attempt ${attempt+1}`);
               ok = true;
               break;
             } catch (e) {
               lastErr = e;
               console.error(`[validate-job ${jobDoc.id}] video ${v._id} attempt ${attempt+1} failed:`, e && (e.stack || e.message || e));
+              // if this error is terminal (e.g. 404/410 on last segment), stop retrying and move on
+              if (e && e.terminal) {
+                console.log(`[validate-job ${jobDoc.id}] video ${v._id} terminal error — skipping further attempts`);
+                break;
+              }
+              attempt += 1;
+              if (Date.now() > deadline) break;
               // small backoff before retrying
               await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
             }
@@ -486,10 +712,49 @@ exports.startValidateAllVideos = async (req, res) => {
 
           if (!ok) {
             const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: false, error: lastErr && (lastErr.message || String(lastErr)), processedAt: new Date() };
-            latestJob.videos.push(rec);
-            latestJob.processedVideos = latestJob.videos.length;
-            await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+            try {
+              latestJob.videos = latestJob.videos || [];
+              const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
+              if (idx >= 0) {
+                latestJob.videos[idx] = rec;
+              } else {
+                latestJob.videos.push(rec);
+              }
+              latestJob.processedVideos = latestJob.videos.length;
+              await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+              validationJobs.set(jobDoc.id, latestJob);
+            } catch (e) {}
             console.error(`[validate-job ${jobDoc.id}] video ${v._id} FAILED after ${maxAttempts} attempts`);
+
+            // Create a broadcast notification for admins so broken videos appear in notifications
+            try {
+              const lecture = await Lecture.findById(v.lectureId).select('title chapterId thumbnailUrl thumbnail').lean();
+              let chapterTitle = null;
+              if (lecture && lecture.chapterId) {
+                const chap = await Chapter.findById(lecture.chapterId).select('title').lean();
+                chapterTitle = chap && chap.title;
+              }
+              const notifTitle = `فيديو غير متاح: ${v.title}`;
+              // avoid spamming duplicates: check for a similar notification in last 24 hours
+              const dayAgo = new Date(Date.now() - 1000 * 60 * 60 * 24);
+              const exists = await Notification.findOne({ lectureId: v.lectureId, title: notifTitle, createdAt: { $gt: dayAgo } });
+              if (!exists) {
+                await Notification.create({
+                  title: notifTitle,
+                  lectureId: v.lectureId,
+                  videoId: v._id,
+                  chapterId: lecture && lecture.chapterId,
+                  thumbnailUrl: (lecture && (lecture.thumbnailUrl || lecture.thumbnail)) || undefined,
+                  chapterTitle: chapterTitle || undefined,
+                  // empty recipients => broadcast
+                  recipients: [],
+                  // this notification is for admins only
+                  adminOnly: true,
+                });
+              }
+            } catch (notifyErr) {
+              console.warn('Failed to create notification for broken video', v._id, notifyErr && (notifyErr.message || notifyErr));
+            }
           }
 
           // progress log
@@ -533,6 +798,32 @@ exports.getValidateJob = async (req, res) => {
   }
 };
 
+// Admin: get latest validation job (prefer running one)
+exports.getLatestValidateJob = async (req, res) => {
+  try {
+    // try find a running job first
+    let jobDoc = await ValidationJob.findOne({ status: 'running' }).sort({ startedAt: -1 });
+    if (!jobDoc) {
+      // fallback to most recent job
+      jobDoc = await ValidationJob.findOne({}).sort({ startedAt: -1 });
+    }
+    if (!jobDoc) return res.json({ ok: true, job: null });
+    // merge any in-memory overrides (like currentVideo, paused, or videos being updated)
+    const inMemory = validationJobs.get(jobDoc.id) || {};
+    const merged = Object.assign({}, jobDoc.toObject(), {
+      paused: inMemory.paused || jobDoc.paused,
+      status: inMemory.status || jobDoc.status,
+      currentVideo: inMemory.currentVideo || jobDoc.currentVideo,
+      videos: inMemory.videos || jobDoc.videos,
+      processedVideos: inMemory.processedVideos || jobDoc.processedVideos,
+    });
+    return res.json({ ok: true, job: merged });
+  } catch (err) {
+    console.error('getLatestValidateJob error', err && err.message);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
 // Admin: list all videos (basic fields) for admin UI
 exports.getAllVideosAdmin = async (req, res) => {
   try {
@@ -548,12 +839,20 @@ exports.getAllVideosAdmin = async (req, res) => {
 exports.pauseValidateJob = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const jobDoc = await ValidationJob.findOne({ id: jobId });
+    const jobDoc = await ValidationJob.findOne({ 
+      $or: [
+        { id: jobId },
+        { _id: jobId }
+      ]
+    });
     if (!jobDoc) return res.status(404).json({ message: 'job not found' });
-    await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { paused: true } });
-    const mem = validationJobs.get(jobId) || {};
+    await ValidationJob.findOneAndUpdate(
+      { _id: jobDoc._id },
+      { $set: { paused: true } }
+    );
+    const mem = validationJobs.get(jobDoc.id || jobId) || {};
     mem.paused = true;
-    validationJobs.set(jobId, mem);
+    validationJobs.set(jobDoc.id || jobId, mem);
     return res.json({ ok: true });
   } catch (err) {
     console.error('pauseValidateJob error', err && err.message);
@@ -565,12 +864,20 @@ exports.pauseValidateJob = async (req, res) => {
 exports.resumeValidateJob = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const jobDoc = await ValidationJob.findOne({ id: jobId });
+    const jobDoc = await ValidationJob.findOne({ 
+      $or: [
+        { id: jobId },
+        { _id: jobId }
+      ]
+    });
     if (!jobDoc) return res.status(404).json({ message: 'job not found' });
-    await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { paused: false } });
-    const mem = validationJobs.get(jobId) || {};
+    await ValidationJob.findOneAndUpdate(
+      { _id: jobDoc._id },
+      { $set: { paused: false } }
+    );
+    const mem = validationJobs.get(jobDoc.id || jobId) || {};
     mem.paused = false;
-    validationJobs.set(jobId, mem);
+    validationJobs.set(jobDoc.id || jobId, mem);
     return res.json({ ok: true });
   } catch (err) {
     console.error('resumeValidateJob error', err && err.message);
@@ -614,6 +921,232 @@ exports.revalidateJobVideo = async (req, res) => {
     return res.status(500).json({ message: err.message });
   }
 };
+
+// Admin: delete a validation job
+exports.deleteValidateJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const jobDoc = await ValidationJob.findOne({ 
+      $or: [
+        { id: jobId },
+        { _id: jobId }
+      ]
+    });
+    if (!jobDoc) return res.status(404).json({ message: 'job not found' });
+    
+    // Delete from memory cache
+    validationJobs.delete(jobDoc.id || jobId);
+    
+    // Delete from database
+    await ValidationJob.findByIdAndDelete(jobDoc._id);
+    
+    return res.json({ ok: true, message: 'Validation job deleted successfully' });
+  } catch (err) {
+    console.error('deleteValidateJob error', err && err.message);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+// Start a simple background scheduler that periodically triggers a validate-all job.
+// It avoids starting a new job while one is running. Interval (minutes) can be configured
+// via env `VIDEO_VALIDATE_INTERVAL_MINUTES` (default 60). This is safe to call multiple
+// times; it will only install the scheduler once per process.
+exports.startValidationScheduler = function startValidationScheduler() {
+  try {
+    if (global.__videoValidationSchedulerStarted) return;
+    // Default to 12 hours (720 minutes) if not configured; can be overridden via env
+    const minutes = parseInt(process.env.VIDEO_VALIDATE_INTERVAL_MINUTES || '720', 10) || 720;
+    const ms = Math.max(1, minutes) * 60 * 1000;
+    global.__videoValidationSchedulerStarted = true;
+
+    // On boot, attempt to resume any running/queued job stored in DB before starting a fresh run.
+    setTimeout(async () => {
+      try {
+        // prefer a job explicitly marked as 'running'
+        let jobDoc = await ValidationJob.findOne({ status: 'running' }).sort({ startedAt: -1 });
+        if (!jobDoc) {
+          // fallback to a queued job (server crashed while queued)
+          jobDoc = await ValidationJob.findOne({ status: 'queued' }).sort({ createdAt: -1 });
+        }
+        if (jobDoc) {
+          try {
+            // hydrate in-memory and resume processing
+            validationJobs.set(jobDoc.id, jobDoc.toObject ? jobDoc.toObject() : jobDoc);
+            console.log('[validate-scheduler] resuming validation job', jobDoc.id);
+            await resumeValidationJob(jobDoc.id);
+            return;
+          } catch (e) {
+            console.error('Failed to resume validation job', jobDoc.id, e && (e.message || e));
+          }
+        }
+        // otherwise start a fresh run
+        if (!hasRunningValidation()) {
+          await exports.startValidateAllVideos({ body: { mirror: false } }, { json: () => {}, status: () => ({ json: () => {} }) });
+        }
+      } catch (e) {
+        console.error('Initial validation run failed', e && (e.message || e));
+      }
+    }, 5000);
+
+    // periodic
+    setInterval(async () => {
+      try {
+        if (hasRunningValidation()) return;
+        await exports.startValidateAllVideos({ body: { mirror: false } }, { json: () => {}, status: () => ({ json: () => {} }) });
+      } catch (e) {
+        console.error('Periodic validation run failed', e && (e.message || e));
+      }
+    }, ms);
+  } catch (err) {
+    console.error('Failed to start validation scheduler', err && (err.message || err));
+  }
+};
+
+// Resume processing of an existing validation job stored in DB (called on startup)
+async function resumeValidationJob(jobId) {
+  try {
+    const jobDoc = await ValidationJob.findOne({ id: jobId });
+    if (!jobDoc) throw new Error('job not found');
+    // mark running
+    const inMemory = validationJobs.get(jobId) || {};
+    inMemory.status = 'running';
+    inMemory.startedAt = inMemory.startedAt || jobDoc.startedAt || new Date();
+    inMemory.paused = false;
+    // ensure videos array exists
+    inMemory.videos = jobDoc.videos || [];
+    inMemory.processedVideos = (inMemory.videos && inMemory.videos.length) || 0;
+    validationJobs.set(jobId, inMemory);
+    await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { status: 'running', startedAt: inMemory.startedAt, paused: false } });
+
+    // build processed set to skip already-validated videos
+    const processedSet = new Set((inMemory.videos || []).map((p) => String(p.videoId)));
+    const videos = await Video.find({}).sort({ createdAt: 1 });
+
+    console.log(`[validate-job ${jobId}] resuming - total videos: ${videos.length}, already processed: ${processedSet.size}`);
+
+    const PER_VIDEO_TIMEOUT_MS = parseInt(process.env.VIDEO_PER_VIDEO_TIMEOUT_MS || '120000', 10);
+
+    for (const v of videos) {
+      // skip already processed
+      if (processedSet.has(String(v._id))) continue;
+
+      // honor pause
+      while (true) {
+        const latest = validationJobs.get(jobId);
+        if (!latest) break;
+        if (latest.paused) {
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        break;
+      }
+
+      const latestJob = validationJobs.get(jobId) || {};
+      latestJob.currentVideo = { videoId: v._id, title: v.title };
+      validationJobs.set(jobId, latestJob);
+      await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { currentVideo: latestJob.currentVideo } });
+
+      // placeholder
+      try {
+        latestJob.videos = latestJob.videos || [];
+        const placeholder = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: undefined, startedAt: new Date() };
+        latestJob.videos.push(placeholder);
+        latestJob.processedVideos = latestJob.videos.length;
+        await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+        validationJobs.set(jobId, latestJob);
+      } catch (e) {}
+
+      // perform validation attempts (reuse same logic as startValidateAllVideos)
+      const maxAttempts = 2;
+      let attempt = 0;
+      let ok = false;
+      let lastErr = null;
+      const startTs = Date.now();
+      const deadline = startTs + PER_VIDEO_TIMEOUT_MS;
+
+      while (attempt < maxAttempts) {
+        if (Date.now() > deadline) { lastErr = lastErr || new Error('video-validation-timeout'); break; }
+        try {
+          const allowFull = (attempt === maxAttempts - 1);
+          let controller = null; let abortTimer = null;
+          try {
+            if (typeof AbortController !== 'undefined') {
+              controller = new AbortController();
+              const remaining = Math.max(1000, deadline - Date.now());
+              abortTimer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, remaining);
+            }
+          } catch (e) { controller = null; }
+
+          const perAttemptTimeout = Math.max(1000, deadline - Date.now());
+          let results;
+          try {
+            results = await Promise.race([
+              validateVideoSegments(v, false, allowFull, { signal: controller ? controller.signal : undefined }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('validate-attempt-timeout')), perAttemptTimeout)),
+            ]);
+          } finally { if (abortTimer) clearTimeout(abortTimer); }
+
+          const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: true, results, processedAt: new Date() };
+          try {
+            latestJob.videos = latestJob.videos || [];
+            const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
+            if (idx >= 0) latestJob.videos[idx] = rec; else latestJob.videos.push(rec);
+            latestJob.processedVideos = latestJob.videos.length;
+            await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+            validationJobs.set(jobId, latestJob);
+          } catch (e) {}
+          ok = true; break;
+        } catch (e) {
+          lastErr = e;
+          if (e && e.terminal) break;
+          attempt += 1;
+          if (Date.now() > deadline) break;
+          await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+        }
+      }
+
+      if (!ok) {
+        const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: false, error: lastErr && (lastErr.message || String(lastErr)), processedAt: new Date() };
+        try {
+          latestJob.videos = latestJob.videos || [];
+          const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
+          if (idx >= 0) latestJob.videos[idx] = rec; else latestJob.videos.push(rec);
+          latestJob.processedVideos = latestJob.videos.length;
+          await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { videos: latestJob.videos, processedVideos: latestJob.processedVideos } });
+          validationJobs.set(jobId, latestJob);
+        } catch (e) {}
+
+        // create notification for admin (best-effort)
+        try {
+          const lecture = await Lecture.findById(v.lectureId).select('title chapterId thumbnailUrl thumbnail').lean();
+          let chapterTitle = null;
+          if (lecture && lecture.chapterId) {
+            const chap = await Chapter.findById(lecture.chapterId).select('title').lean();
+            chapterTitle = chap && chap.title;
+          }
+          const notifTitle = `فيديو غير متاح: ${v.title}`;
+          const dayAgo = new Date(Date.now() - 1000 * 60 * 60 * 24);
+          const exists = await Notification.findOne({ lectureId: v.lectureId, title: notifTitle, createdAt: { $gt: dayAgo } });
+          if (!exists) {
+            await Notification.create({ title: notifTitle, lectureId: v.lectureId, videoId: v._id, chapterId: lecture && lecture.chapterId, thumbnailUrl: (lecture && (lecture.thumbnailUrl || lecture.thumbnail)) || undefined, chapterTitle: chapterTitle || undefined, recipients: [], adminOnly: true });
+          }
+        } catch (notifyErr) { console.warn('Failed to create notification for broken video', v._id, notifyErr && (notifyErr.message || notifyErr)); }
+      }
+
+    }
+
+    const finishedAt = new Date();
+    const finishedUpdate = { status: 'finished', currentVideo: null, finishedAt };
+    validationJobs.set(jobId, { ...(validationJobs.get(jobId) || {}), ...finishedUpdate });
+    await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: finishedUpdate });
+    console.log(`[validate-job ${jobId}] resumed run finished - processed ${ (validationJobs.get(jobId) || {}).processedVideos || 0 }/${(validationJobs.get(jobId) || {}).totalVideos || 0}`);
+  } catch (err) {
+    const failedAt = new Date();
+    validationJobs.set(jobId, { ...(validationJobs.get(jobId) || {}), status: 'failed', error: err && err.message, finishedAt: failedAt });
+    await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { status: 'failed', error: err && err.message, finishedAt: failedAt } });
+    console.error('resumeValidationJob error', err && (err.stack || err.message || err));
+  }
+}
 
 // Admin: list users who viewed a specific video
 exports.getVideoViewers = async (req, res) => {
@@ -696,6 +1229,53 @@ exports.updateVideo = async (req, res) => {
 
     const updated = await VideoModel.findByIdAndUpdate(videoId, update, { new: true });
     if (!updated) return res.status(404).json({ message: 'video not found' });
+
+    // After admin updates a video, attempt a quick validation in background.
+    (async () => {
+      try {
+        // run a focused validation (allow full check) to see if the video is now available
+        const results = await validateVideoSegments(updated, false, true);
+        // results: { quality: [{ segment, ok, ... }] }
+        let ok = false;
+        try {
+          for (const q of Object.keys(results || {})) {
+            const arr = results[q] || [];
+            if (arr.length > 0 && arr.every((s) => s.ok)) {
+              ok = true; break;
+            }
+          }
+        } catch (e) {}
+
+        if (ok) {
+          try {
+            // remove stale 'video unavailable' notifications for this video (avoid spam)
+            await Notification.deleteMany({ videoId: updated._id, title: { $regex: '^فيديو غير متاح:' } });
+          } catch (e) {}
+          try {
+            // create an admin notification that the video is restored
+            const lecture = await Lecture.findById(updated.lectureId).select('title chapterId thumbnailUrl thumbnail').lean();
+            let chapterTitle = null;
+            if (lecture && lecture.chapterId) {
+              const chap = await Chapter.findById(lecture.chapterId).select('title').lean();
+              chapterTitle = chap && chap.title;
+            }
+            const notifTitle = `فيديو متاح الآن: ${updated.title}`;
+            await Notification.create({
+              title: notifTitle,
+              lectureId: updated.lectureId,
+              videoId: updated._id,
+              chapterId: lecture && lecture.chapterId,
+              thumbnailUrl: (lecture && (lecture.thumbnailUrl || lecture.thumbnail)) || undefined,
+              chapterTitle: chapterTitle || undefined,
+              recipients: [],
+              adminOnly: true,
+            });
+          } catch (e) {}
+        }
+      } catch (e) {
+        // ignore background validation errors
+      }
+    })();
     return res.json(updated);
   } catch (err) {
     console.error('updateVideo error', err);

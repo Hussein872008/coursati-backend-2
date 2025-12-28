@@ -4,15 +4,35 @@ const Notification = require('../models/Notification');
 exports.getNotifications = async (req, res) => {
   try {
     const userId = req.user?._id;
-    // Notifications sent to all (recipients empty) or to this user
-    const notifications = await Notification.find({
-      $or: [
-        { recipients: { $size: 0 } },
-        { recipients: userId },
-      ],
-    })
-      .sort({ createdAt: -1 })
-      .lean();
+    const isAdmin = !!req.user?.isAdmin;
+    // Build query:
+    // - If unauthenticated: only non-admin broadcasts
+    // - If authenticated non-admin: non-admin broadcasts or explicit recipient
+    // - If admin: include adminOnly notifications as well
+    let query = null;
+    if (!userId) {
+      // public: broadcast notifications that are not adminOnly
+      query = { recipients: { $size: 0 }, adminOnly: { $ne: true } };
+    } else if (isAdmin) {
+      // admin: receive everything addressed to them or admin-only or broadcasts
+      query = {
+        $or: [
+          { adminOnly: true },
+          { recipients: { $size: 0 } },
+          { recipients: userId },
+        ],
+      };
+    } else {
+      // authenticated non-admin
+      query = {
+        $or: [
+          { recipients: { $size: 0 }, adminOnly: { $ne: true } },
+          { recipients: userId },
+        ],
+      };
+    }
+
+    const notifications = await Notification.find(query).sort({ createdAt: -1 }).lean();
 
     // mark read flag per notification for this user
     const result = notifications.map((n) => ({
@@ -58,6 +78,22 @@ exports.markAllRead = async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error('markAllRead error', err);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+// Delete all notifications for the authenticated user (admin only)
+exports.deleteAllNotifications = async (req, res) => {
+  try {
+    const userId = req.user?._id;
+    const isAdmin = !!req.user?.isAdmin;
+    if (!userId || !isAdmin) return res.status(401).json({ message: 'Unauthorized' });
+    
+    // Delete all notifications
+    const result = await Notification.deleteMany({});
+    return res.json({ success: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('deleteAllNotifications error', err);
     return res.status(500).json({ message: err.message });
   }
 };

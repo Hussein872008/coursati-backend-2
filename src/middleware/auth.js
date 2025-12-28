@@ -2,6 +2,8 @@
 const authMiddleware = async (req, res, next) => {
   // allow user code to come from header or query param (for browser downloads)
   const userCode = req.headers['user-code'] || req.query.userCode || req.query['user-code'];
+  // DEBUG: log incoming header for diagnosis (remove in production)
+
   // device id header used to enforce single-browser usage
   const deviceId = req.headers['device-id'] || req.headers['device_id'] || req.query.deviceId || req.query['device-id'];
   // session token header used to validate active session
@@ -14,6 +16,7 @@ const authMiddleware = async (req, res, next) => {
   const User = require('../models/User');
   try {
     const user = await User.findOne({ code: userCode });
+    // DEBUG: show whether user was found (remove in production)
     if (!user) {
       return res.status(401).json({ message: 'Invalid user code' });
     }

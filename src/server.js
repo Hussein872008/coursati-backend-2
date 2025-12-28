@@ -85,12 +85,23 @@ mongoose
       if (process.env.NODE_ENV !== 'production') {
         console.log(`Server running on http://localhost:${PORT}`);
       }
+      try {
+        // start periodic video validation scheduler (optional)
+        const videoController = require('./controllers/videoController');
+        if (videoController && typeof videoController.startValidationScheduler === 'function') {
+          videoController.startValidationScheduler();
+          if (process.env.NODE_ENV !== 'production') console.log('Video validation scheduler started');
+        }
+      } catch (e) {
+        console.error('Failed to start video validation scheduler', e && (e.message || e));
+      }
     });
   })
   .catch((err) => {
     console.error('MongoDB connection failed', err && err.message);
     process.exit(1);
   });
+
 
 // =====================
 // Public Routes
@@ -144,6 +155,5 @@ app.use((err, req, res, next) => {
 app.use((req, res) => {
   res.status(404).json({ message: 'Not found' });
 });
-
 
 // Note: server starts after successful MongoDB connection above

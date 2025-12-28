@@ -4,6 +4,9 @@ const { authMiddleware, optionalAuth, adminMiddleware, checkSubscription } = req
 
 const router = express.Router();
 
+// Public: quick availability check for a lecture's videos (no auth)
+router.get('/public/lecture/:lectureId/availability', videoController.getLectureAvailabilityPublic);
+
 // Protected: get videos by lecture (require active subscription)
 router.get('/lecture/:lectureId', authMiddleware, checkSubscription, videoController.getVideosByLecture);
 
@@ -15,9 +18,10 @@ router.get('/:videoId/playlist/:quality.m3u8', authMiddleware, checkSubscription
 router.get('/:videoId/viewers', authMiddleware, adminMiddleware, videoController.getVideoViewers);
 // Admin: delete a video
 router.delete('/:videoId', authMiddleware, adminMiddleware, videoController.deleteVideo);
+// Admin: update video metadata (title, duration)
+router.put('/:videoId', authMiddleware, adminMiddleware, videoController.updateVideo);
 // Record a view for a specific video (requires subscription)
 router.post('/:videoId/view', authMiddleware, checkSubscription, videoController.recordVideoView);
-
 // Download assembled file (streams segments sequentially). Requires active session/subscription and download permission.
 router.get('/:videoId/download', authMiddleware, checkSubscription, videoController.download);
 

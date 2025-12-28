@@ -21,12 +21,16 @@ router.get('/lectures/:id', authMiddleware, adminMiddleware, lectureController.g
 router.post('/videos/:videoId/validate', authMiddleware, adminMiddleware, videoController.validateVideo);
 // Admin: validate all videos (runs per-video validation sequentially)
 router.post('/videos/validate-all', authMiddleware, adminMiddleware, videoController.startValidateAllVideos);
+// Ensure the explicit `/latest` route is registered before the `:jobId` param
+router.get('/videos/validate-all/latest', authMiddleware, adminMiddleware, videoController.getLatestValidateJob);
 router.get('/videos/validate-all/:jobId', authMiddleware, adminMiddleware, videoController.getValidateJob);
 // Admin: list all videos for dashboard
 router.get('/videos', authMiddleware, adminMiddleware, videoController.getAllVideosAdmin);
 // Pause/resume a validation job
 router.post('/videos/validate-all/:jobId/pause', authMiddleware, adminMiddleware, videoController.pauseValidateJob);
 router.post('/videos/validate-all/:jobId/resume', authMiddleware, adminMiddleware, videoController.resumeValidateJob);
+// Delete a validation job
+router.delete('/videos/validate-all/:jobId', authMiddleware, adminMiddleware, videoController.deleteValidateJob);
 // Revalidate a specific video and append result to job ("jump to failed")
 router.post('/videos/validate-all/:jobId/revalidate/:videoId', authMiddleware, adminMiddleware, videoController.revalidateJobVideo);
 // Admin: update video metadata
