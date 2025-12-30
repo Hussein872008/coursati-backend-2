@@ -20,6 +20,20 @@ router.get('/:videoId/viewers', authMiddleware, adminMiddleware, videoController
 router.delete('/:videoId', authMiddleware, adminMiddleware, videoController.deleteVideo);
 // Admin: update video metadata (title, duration)
 router.put('/:videoId', authMiddleware, adminMiddleware, videoController.updateVideo);
+// Admin: validate a single video (sync) and optionally mirror
+router.post('/:videoId/validate', authMiddleware, adminMiddleware, videoController.validateVideo);
+
+// Admin: validation job control
+router.post('/admin/validate/start', authMiddleware, adminMiddleware, videoController.startValidateAllVideos);
+router.get('/admin/validate/job/:jobId', authMiddleware, adminMiddleware, videoController.getValidateJob);
+router.get('/admin/validate/latest', authMiddleware, adminMiddleware, videoController.getLatestValidateJob);
+router.post('/admin/validate/:jobId/pause', authMiddleware, adminMiddleware, videoController.pauseValidateJob);
+router.post('/admin/validate/:jobId/resume', authMiddleware, adminMiddleware, videoController.resumeValidateJob);
+router.delete('/admin/validate/:jobId', authMiddleware, adminMiddleware, videoController.deleteValidateJob);
+// Admin: revalidate a single video inside a job context (append result)
+router.post('/admin/validate/:jobId/revalidate/:videoId', authMiddleware, adminMiddleware, videoController.revalidateJobVideo);
+router.post('/admin/validate/:jobId/stop', authMiddleware, adminMiddleware, videoController.stopValidateJob);
+router.get('/admin/validate/jobs', authMiddleware, adminMiddleware, videoController.listValidateJobs);
 // Record a view for a specific video (requires subscription)
 router.post('/:videoId/view', authMiddleware, checkSubscription, videoController.recordVideoView);
 // Download assembled file (streams segments sequentially). Requires active session/subscription and download permission.

@@ -33,6 +33,10 @@ router.post('/videos/validate-all/:jobId/resume', authMiddleware, adminMiddlewar
 router.delete('/videos/validate-all/:jobId', authMiddleware, adminMiddleware, videoController.deleteValidateJob);
 // Revalidate a specific video and append result to job ("jump to failed")
 router.post('/videos/validate-all/:jobId/revalidate/:videoId', authMiddleware, adminMiddleware, videoController.revalidateJobVideo);
+// Stop a validation job
+router.post('/videos/validate-all/:jobId/stop', authMiddleware, adminMiddleware, videoController.stopValidateJob);
+// List recent validation jobs
+router.get('/videos/validate-all/jobs', authMiddleware, adminMiddleware, videoController.listValidateJobs);
 // Admin: update video metadata
 router.put('/videos/:videoId', authMiddleware, adminMiddleware, videoController.updateVideo);
 module.exports = router;

@@ -7,6 +7,31 @@ const jwt = require('jsonwebtoken');
 const gridfs = require('../utils/gridfs');
 const ValidationJob = require('../models/ValidationJob');
 
+// Helper: optionally POST job summary to a configured webhook when job finishes/fails/stops
+async function sendValidationWebhook(jobRecord) {
+  try {
+    const webhook = process.env.VIDEO_VALIDATION_WEBHOOK;
+    if (!webhook) return;
+    // allow threshold: only send when failures >= threshold (default 1)
+    const minFails = parseInt(process.env.VIDEO_VALIDATION_WEBHOOK_MIN_FAILS || '1', 10) || 1;
+    const totalFailed = (jobRecord && jobRecord.videos && jobRecord.videos.reduce((acc, v) => acc + ((v && v.ok) ? 0 : 1), 0)) || 0;
+    if (totalFailed < minFails) return;
+    const payload = {
+      id: jobRecord.id || jobRecord._id,
+      status: jobRecord.status,
+      totalVideos: jobRecord.totalVideos || (jobRecord.videos && jobRecord.videos.length) || 0,
+      processedVideos: jobRecord.processedVideos || (jobRecord.videos && jobRecord.videos.length) || 0,
+      totalFailed,
+      finishedAt: jobRecord.finishedAt || new Date(),
+    };
+    // fire-and-forget with short timeout
+    await axios.post(webhook, payload, { timeout: 5000 }).catch(() => {});
+  } catch (e) {
+    // swallow webhook errors
+    try { console.warn('sendValidationWebhook failed', e && (e.message || e)); } catch (er) {}
+  }
+}
+
 const signSecret = process.env.VIDEO_SIGN_SECRET || process.env.JWT_SECRET;
 
 function parseTtlToSeconds(ttl) {
@@ -427,8 +452,33 @@ async function validateVideoSegments(video, mirror, allowFullCheck = true, optio
   const baseCfg = {};
   if (allowInsecure) baseCfg.httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
+  // helper: fetch a URL with a small retry/backoff strategy
+  async function fetchWithRetries(method, url, cfg = {}, maxAttempts = 3) {
+    let attempt = 0;
+    let lastErr = null;
+    const baseDelay = 200;
+    for (; attempt < maxAttempts; attempt++) {
+      try {
+        if (method === 'head') return await axios.head(url, cfg);
+        return await axios.get(url, cfg);
+      } catch (err) {
+        lastErr = err;
+        // treat 404/410 as terminal for HEAD quick-checks (caller may decide)
+        const status = err && err.response && err.response.status;
+        if (status === 410 || status === 404) throw err;
+        // for 429 (rate limit) and 5xx, back off longer
+        const delay = baseDelay * Math.pow(2, attempt) + (status === 429 ? 800 : 0);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+    }
+    throw lastErr;
+  }
+
   for (const q of video.qualities) {
     results[q.quality] = [];
+    // per-quality summary collector
+    const qSummary = { totalChecked: 0, okCount: 0, failedCount: 0, failedSegments: [], mirrorErrors: [] };
 
     // Quick check: try the stored lastSegmentUrl (or url) once and short-circuit if it responds OK.
     const lastBase = q.lastSegmentUrl || q.url || '';
@@ -436,23 +486,33 @@ async function validateVideoSegments(video, mirror, allowFullCheck = true, optio
       try {
         const cfg = { ...baseCfg, timeout: AXIOS_TIMEOUT };
         if (options && options.signal) cfg.signal = options.signal;
-        const resp = await axios.head(lastBase, cfg).catch(async (e) => {
-          return axios.get(lastBase, { ...cfg, responseType: 'arraybuffer' }).then(r => r).catch((err) => { throw err; });
-        });
-        results[q.quality].push({ segment: 'last', ok: true, status: resp.status || 200, url: lastBase, note: 'lastSegment quick check' });
+        // prefer HEAD, but fall back to GET if HEAD is not allowed; use fetchWithRetries which handles transient errors
+        let resp;
+        try {
+          resp = await fetchWithRetries('head', lastBase, cfg, 2);
+        } catch (hErr) {
+          // try GET as fallback
+          resp = await fetchWithRetries('get', lastBase, { ...cfg, responseType: 'arraybuffer' }, 2);
+        }
+        const rec = { segment: 'last', ok: true, status: resp.status || 200, url: lastBase, note: 'lastSegment quick check' };
+        results[q.quality].push(rec);
+        qSummary.totalChecked += 1; qSummary.okCount += 1;
         if (mirror) {
           try {
             const r2cfg = { ...baseCfg, responseType: 'stream', timeout: AXIOS_TIMEOUT };
             if (options && options.signal) r2cfg.signal = options.signal;
-            const r2 = await axios.get(lastBase, r2cfg);
-            const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, 'last', r2.data, r2.headers['content-type'] || 'application/octet-stream');
+            const r2 = await fetchWithRetries('get', lastBase, r2cfg, 2);
+            const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, 'last', r2.data, r2.headers && r2.headers['content-type'] ? r2.headers['content-type'] : 'application/octet-stream');
             results[q.quality][results[q.quality].length-1].mirrored = `gridfs://${upload.filename}`;
           } catch (e) {
-            results[q.quality][results[q.quality].length-1].mirrored = null;
-            results[q.quality][results[q.quality].length-1].mirrorError = e && e.message;
+              results[q.quality][results[q.quality].length-1].mirrored = null;
+              results[q.quality][results[q.quality].length-1].mirrorError = { message: e && (e.message || String(e)), stack: e && e.stack, status: e && e.response && e.response.status };
+              qSummary.mirrorErrors.push({ message: e && (e.message || String(e)), stack: e && e.stack, status: e && e.response && e.response.status });
           }
         }
         // short-circuit: consider this quality validated
+        // attach summary and continue
+        results[q.quality].summary = qSummary;
         continue;
       } catch (err) {
         // last-segment check failed
@@ -519,32 +579,53 @@ async function validateVideoSegments(video, mirror, allowFullCheck = true, optio
         try {
           const cfg = { ...baseCfg, timeout: AXIOS_TIMEOUT };
           if (options && options.signal) cfg.signal = options.signal;
-          const resp = await axios.head(finalUrl, cfg).catch(async (e) => {
-            return axios.get(finalUrl, { ...cfg, responseType: 'arraybuffer' }).then(r=>r).catch((err)=>{ throw err; });
-          });
+          // prefer HEAD then GET with retries/backoff
+          let resp;
+          try {
+            resp = await fetchWithRetries('head', finalUrl, cfg, 2);
+          } catch (hErr) {
+            resp = await fetchWithRetries('get', finalUrl, { ...cfg, responseType: 'arraybuffer' }, 2);
+          }
           const rec = { segment: i, ok: true, status: resp.status || 200, url: finalUrl };
           if (mirror) {
             try {
               const r2cfg = { ...baseCfg, responseType: 'stream', timeout: AXIOS_TIMEOUT };
               if (options && options.signal) r2cfg.signal = options.signal;
-              const r2 = await axios.get(finalUrl, r2cfg);
-              const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, i, r2.data, r2.headers['content-type'] || 'application/octet-stream');
+              const r2 = await fetchWithRetries('get', finalUrl, r2cfg, 2);
+              const upload = await gridfs.uploadStreamFromStream(video._id.toString(), q.quality, i, r2.data, r2.headers && r2.headers['content-type'] ? r2.headers['content-type'] : 'application/octet-stream');
               rec.mirrored = `gridfs://${upload.filename}`;
             } catch (e) {
               rec.mirrored = null;
-              rec.mirrorError = e && e.message;
+              rec.mirrorError = { message: e && (e.message || String(e)), stack: e && e.stack, status: e && e.response && e.response.status };
+              qSummary.mirrorErrors.push({ message: e && (e.message || String(e)), stack: e && e.stack, status: e && e.response && e.response.status });
             }
           }
+          qSummary.totalChecked += 1; qSummary.okCount += 1;
           return rec;
         } catch (err) {
-          return { segment: i, ok: false, error: err && (err.message || String(err)), url: finalUrl };
+          const eStr = err && (err.stack || err.message || String(err));
+          qSummary.totalChecked += 1; qSummary.failedCount += 1; qSummary.failedSegments.push(i);
+          return { segment: i, ok: false, error: err && (err.message || String(err)), errorStack: eStr, url: finalUrl };
         }
       });
 
       const settled = await Promise.all(promises);
       results[q.quality].push(...settled);
     }
+    // attach per-quality summary
+    results[q.quality].summary = qSummary;
   }
+  // compute overall meta
+  const meta = { totalQualities: Object.keys(results).length, timestamp: new Date() };
+  let totalChecked = 0; let totalFailed = 0; const qualities = {};
+  for (const k of Object.keys(results)) {
+    const s = results[k] && results[k].summary ? results[k].summary : { totalChecked: 0, failedCount: 0 };
+    qualities[k] = s;
+    totalChecked += s.totalChecked || 0;
+    totalFailed += s.failedCount || 0;
+  }
+  meta.totalChecked = totalChecked; meta.totalFailed = totalFailed; meta.qualities = qualities;
+  results._meta = meta;
   return results;
 }
 
@@ -582,6 +663,10 @@ function createJobRecord() {
 exports.startValidateAllVideos = async (req, res) => {
   try {
     const { mirror } = req.body || {};
+    // prevent concurrent validate-all jobs
+    if (hasRunningValidation()) {
+      return res.status(409).json({ message: 'A validation job is already running' });
+    }
     const job = createJobRecord();
 
     // Persist initial job doc
@@ -608,16 +693,26 @@ exports.startValidateAllVideos = async (req, res) => {
         const PER_VIDEO_TIMEOUT_MS = parseInt(process.env.VIDEO_PER_VIDEO_TIMEOUT_MS || '120000', 10);
 
         for (const v of videos) {
-          // honor pause requests
-          while (true) {
-            const latest = validationJobs.get(jobDoc.id);
-            if (!latest) break; // job removed
-            if (latest.paused) {
-              await new Promise((r) => setTimeout(r, 500));
-              continue;
-            }
-            break;
-          }
+                // honor pause/stop requests
+                while (true) {
+                  const latest = validationJobs.get(jobDoc.id);
+                  if (!latest) break; // job removed
+                  if (latest.status === 'stopped') {
+                          console.log(`[validate-job ${jobDoc.id}] stopped by admin`);
+                          // mark finished as stopped
+                          const finishedAt = new Date();
+                          const finishedUpdate = { status: 'stopped', currentVideo: null, finishedAt };
+                          validationJobs.set(jobDoc.id, { ...(validationJobs.get(jobDoc.id) || {}), ...finishedUpdate });
+                          await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: finishedUpdate });
+                          try { await sendValidationWebhook(Object.assign({}, (validationJobs.get(jobDoc.id) || {}), finishedUpdate)); } catch (e) {}
+                          return;
+                  }
+                  if (latest.paused) {
+                    await new Promise((r) => setTimeout(r, 500));
+                    continue;
+                  }
+                  break;
+                }
 
           const latestJob = validationJobs.get(jobDoc.id) || {};
           latestJob.currentVideo = { videoId: v._id, title: v.title };
@@ -680,6 +775,19 @@ exports.startValidateAllVideos = async (req, res) => {
                 if (abortTimer) clearTimeout(abortTimer);
               }
               const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: true, results, processedAt: new Date() };
+              // attach high-level summary into the job record for UI
+              try {
+                const meta = results && results._meta ? results._meta : null;
+                const qualitiesSummary = {};
+                if (results) {
+                  for (const qq of Object.keys(results)) {
+                    if (qq === '_meta') continue;
+                    const arr = results[qq] || [];
+                    qualitiesSummary[qq] = arr.summary || { totalChecked: arr.length, failedCount: (arr.filter && arr.filter(x=>!x.ok).length) || 0 };
+                  }
+                }
+                rec.summary = { meta, qualities: qualitiesSummary };
+              } catch (e) {}
               try {
                 latestJob.videos = latestJob.videos || [];
                 const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
@@ -712,6 +820,7 @@ exports.startValidateAllVideos = async (req, res) => {
 
           if (!ok) {
             const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: false, error: lastErr && (lastErr.message || String(lastErr)), processedAt: new Date() };
+            try { rec.errorStack = lastErr && (lastErr.stack || lastErr.message || String(lastErr)); } catch (e) {}
             try {
               latestJob.videos = latestJob.videos || [];
               const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
@@ -765,11 +874,14 @@ exports.startValidateAllVideos = async (req, res) => {
         const finishedUpdate = { status: 'finished', currentVideo: null, finishedAt };
         validationJobs.set(jobDoc.id, { ...(validationJobs.get(jobDoc.id) || {}), ...finishedUpdate });
         await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: finishedUpdate });
+        try { await sendValidationWebhook(Object.assign({}, (validationJobs.get(jobDoc.id) || {}), finishedUpdate)); } catch (e) {}
         console.log(`[validate-job ${jobDoc.id}] finished - processed ${ (validationJobs.get(jobDoc.id) || {}).processedVideos || 0 }/${(validationJobs.get(jobDoc.id) || {}).totalVideos || 0}`);
       } catch (err) {
         const failedAt = new Date();
-        validationJobs.set(jobDoc.id, { ...(validationJobs.get(jobDoc.id) || {}), status: 'failed', error: err && err.message, finishedAt: failedAt });
-        await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { status: 'failed', error: err && err.message, finishedAt: failedAt } });
+        const failureRecord = { ...(validationJobs.get(jobDoc.id) || {}), status: 'failed', error: err && (err.message || String(err)), finishedAt: failedAt };
+        validationJobs.set(jobDoc.id, failureRecord);
+        await ValidationJob.findOneAndUpdate({ id: jobDoc.id }, { $set: { status: 'failed', error: err && (err.message || String(err)), finishedAt: failedAt } });
+        try { await sendValidationWebhook(failureRecord); } catch (e) {}
         console.error('startValidateAllVideos background error', err && (err.stack || err.message || err));
       }
     })();
@@ -885,6 +997,51 @@ exports.resumeValidateJob = async (req, res) => {
   }
 };
 
+// Admin: stop a validation job (mark stopped and signal background worker)
+exports.stopValidateJob = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const jobDoc = await ValidationJob.findOne({ 
+      $or: [
+        { id: jobId },
+        { _id: jobId }
+      ]
+    });
+    if (!jobDoc) return res.status(404).json({ message: 'job not found' });
+
+    // Update DB status
+    await ValidationJob.findOneAndUpdate(
+      { _id: jobDoc._id },
+      { $set: { status: 'stopped' } }
+    );
+    // update in-memory signal
+    const mem = validationJobs.get(jobDoc.id || jobId) || {};
+    mem.status = 'stopped';
+    mem.paused = false;
+    validationJobs.set(jobDoc.id || jobId, mem);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('stopValidateJob error', err && err.message);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+// Admin: list validation jobs (basic)
+exports.listValidateJobs = async (req, res) => {
+  try {
+    const jobs = await ValidationJob.find({}).sort({ createdAt: -1 }).limit(100);
+    // merge in-memory flags
+    const out = jobs.map((j) => {
+      const mem = validationJobs.get(j.id) || {};
+      return Object.assign({}, j.toObject ? j.toObject() : j, { paused: mem.paused || j.paused, status: mem.status || j.status, currentVideo: mem.currentVideo || j.currentVideo, processedVideos: (typeof mem.processedVideos !== 'undefined') ? mem.processedVideos : j.processedVideos, totalVideos: (typeof mem.totalVideos !== 'undefined') ? mem.totalVideos : j.totalVideos });
+    });
+    return res.json({ ok: true, jobs: out });
+  } catch (err) {
+    console.error('listValidateJobs error', err && err.message);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
 // Admin: revalidate a single video and append result to a job ("jump to failed")
 exports.revalidateJobVideo = async (req, res) => {
   try {
@@ -896,6 +1053,18 @@ exports.revalidateJobVideo = async (req, res) => {
     try {
       const results = await validateVideoSegments(v, false, false);
       const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: true, results, processedAt: new Date() };
+      try {
+        const meta = results && results._meta ? results._meta : null;
+        const qualitiesSummary = {};
+        if (results) {
+          for (const qq of Object.keys(results)) {
+            if (qq === '_meta') continue;
+            const arr = results[qq] || [];
+            qualitiesSummary[qq] = arr.summary || { totalChecked: arr.length, failedCount: (arr.filter && arr.filter(x=>!x.ok).length) || 0 };
+          }
+        }
+        rec.summary = { meta, qualities: qualitiesSummary };
+      } catch (e) {}
       jobDoc.videos.push(rec);
       jobDoc.processedVideos = jobDoc.videos.length;
       await jobDoc.save();
@@ -907,6 +1076,7 @@ exports.revalidateJobVideo = async (req, res) => {
       return res.json({ ok: true, rec });
     } catch (err) {
       const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: false, error: err && (err.message || String(err)), processedAt: new Date() };
+      try { rec.errorStack = err && (err.stack || err.message || String(err)); } catch (e) {}
       jobDoc.videos.push(rec);
       jobDoc.processedVideos = jobDoc.videos.length;
       await jobDoc.save();
@@ -1019,7 +1189,9 @@ async function resumeValidationJob(jobId) {
     await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: { status: 'running', startedAt: inMemory.startedAt, paused: false } });
 
     // build processed set to skip already-validated videos
-    const processedSet = new Set((inMemory.videos || []).map((p) => String(p.videoId)));
+    // NOTE: ignore placeholders where `ok` is still undefined so partially-written placeholders
+    // don't cause a video to be skipped on resume.
+    const processedSet = new Set((inMemory.videos || []).filter((p) => typeof p.ok !== 'undefined').map((p) => String(p.videoId)));
     const videos = await Video.find({}).sort({ createdAt: 1 });
 
     console.log(`[validate-job ${jobId}] resuming - total videos: ${videos.length}, already processed: ${processedSet.size}`);
@@ -1030,10 +1202,19 @@ async function resumeValidationJob(jobId) {
       // skip already processed
       if (processedSet.has(String(v._id))) continue;
 
-      // honor pause
+      // honor pause/stop
       while (true) {
         const latest = validationJobs.get(jobId);
         if (!latest) break;
+        if (latest.status === 'stopped') {
+            console.log(`[validate-job ${jobId}] stopped by admin during resume`);
+            const finishedAt = new Date();
+            const finishedUpdate = { status: 'stopped', currentVideo: null, finishedAt };
+            validationJobs.set(jobId, { ...(validationJobs.get(jobId) || {}), ...finishedUpdate });
+            await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: finishedUpdate });
+            try { await sendValidationWebhook(Object.assign({}, (validationJobs.get(jobId) || {}), finishedUpdate)); } catch (e) {}
+            return;
+        }
         if (latest.paused) {
           await new Promise((r) => setTimeout(r, 500));
           continue;
@@ -1088,6 +1269,19 @@ async function resumeValidationJob(jobId) {
 
           const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: true, results, processedAt: new Date() };
           try {
+            // attach per-video summary for resumed jobs as well
+            try {
+              const meta = results && results._meta ? results._meta : null;
+              const qualitiesSummary = {};
+              if (results) {
+                for (const qq of Object.keys(results)) {
+                  if (qq === '_meta') continue;
+                  const arr = results[qq] || [];
+                  qualitiesSummary[qq] = arr.summary || { totalChecked: arr.length, failedCount: (arr.filter && arr.filter(x=>!x.ok).length) || 0 };
+                }
+              }
+              rec.summary = { meta, qualities: qualitiesSummary };
+            } catch (e) {}
             latestJob.videos = latestJob.videos || [];
             const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
             if (idx >= 0) latestJob.videos[idx] = rec; else latestJob.videos.push(rec);
@@ -1107,6 +1301,10 @@ async function resumeValidationJob(jobId) {
 
       if (!ok) {
         const rec = { videoId: v._id, lectureId: v.lectureId, title: v.title, ok: false, error: lastErr && (lastErr.message || String(lastErr)), processedAt: new Date() };
+          try {
+            // include stack or diagnostic from lastErr if available
+            rec.errorStack = lastErr && (lastErr.stack || lastErr.message || String(lastErr));
+          } catch (e) {}
         try {
           latestJob.videos = latestJob.videos || [];
           const idx = latestJob.videos.findIndex((it) => String(it.videoId) === String(v._id));
@@ -1139,6 +1337,7 @@ async function resumeValidationJob(jobId) {
     const finishedUpdate = { status: 'finished', currentVideo: null, finishedAt };
     validationJobs.set(jobId, { ...(validationJobs.get(jobId) || {}), ...finishedUpdate });
     await ValidationJob.findOneAndUpdate({ id: jobId }, { $set: finishedUpdate });
+    try { await sendValidationWebhook(Object.assign({}, (validationJobs.get(jobId) || {}), finishedUpdate)); } catch (e) {}
     console.log(`[validate-job ${jobId}] resumed run finished - processed ${ (validationJobs.get(jobId) || {}).processedVideos || 0 }/${(validationJobs.get(jobId) || {}).totalVideos || 0}`);
   } catch (err) {
     const failedAt = new Date();
