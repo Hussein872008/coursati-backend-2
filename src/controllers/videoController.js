@@ -1571,31 +1571,14 @@ exports.download = async (req, res) => {
       finalUrls.push(parts.join('/'));
     }
 
-    // Try to compute total length by doing HEAD requests for each segment (may fail)
-    let totalBytes = 0;
-    let canComputeTotal = true;
-    const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
-    const https = require('https');
-    const axiosConfigBase = {};
-    if (allowInsecure) axiosConfigBase.httpsAgent = new https.Agent({ rejectUnauthorized: false });
-    for (const u of finalUrls) {
-      try {
-        const hres = await require('axios').head(u, axiosConfigBase);
-        const cl = hres.headers && (hres.headers['content-length'] || hres.headers['content-length'.toLowerCase()]);
-        const n = cl ? parseInt(cl, 10) : NaN;
-        if (isNaN(n)) { canComputeTotal = false; break; }
-        totalBytes += n;
-      } catch (e) {
-        canComputeTotal = false;
-        break;
-      }
-    }
-
-    if (canComputeTotal && totalBytes > 0) {
-      try { res.setHeader('Content-Length', String(totalBytes)); } catch (e) { }
-    }
+    // Skip doing HEAD requests for each segment to compute total size.
+    // Performing those HEAD requests can introduce a noticeable "preparing" delay
+    // before any bytes reach the client. We stream segments immediately so the
+    // browser starts the download right away (Transfer-Encoding: chunked).
 
     // Stream segments sequentially
+    const allowInsecure = String(process.env.VIDEO_ALLOW_INSECURE_UPSTREAM || '').toLowerCase() === 'true';
+    const https = require('https');
     const axiosConfigStream = { responseType: 'stream' };
     if (allowInsecure) axiosConfigStream.httpsAgent = new https.Agent({ rejectUnauthorized: false });
     for (const finalUrl of finalUrls) {
