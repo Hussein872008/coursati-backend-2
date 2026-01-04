@@ -22,7 +22,6 @@ router.delete('/:videoId', authMiddleware, adminMiddleware, videoController.dele
 router.put('/:videoId', authMiddleware, adminMiddleware, videoController.updateVideo);
 // Admin: validate a single video (sync) and optionally mirror
 router.post('/:videoId/validate', authMiddleware, adminMiddleware, videoController.validateVideo);
-
 // Admin: validation job control
 router.post('/admin/validate/start', authMiddleware, adminMiddleware, videoController.startValidateAllVideos);
 router.get('/admin/validate/job/:jobId', authMiddleware, adminMiddleware, videoController.getValidateJob);

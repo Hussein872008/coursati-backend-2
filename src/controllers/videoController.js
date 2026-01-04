@@ -1451,24 +1451,29 @@ exports.updateVideo = async (req, res) => {
             await Notification.deleteMany({ videoId: updated._id, title: { $regex: '^فيديو غير متاح:' } });
           } catch (e) {}
           try {
-            // create an admin notification that the video is restored
+            // If there are no more 'video unavailable' admin notifications for the whole lecture,
+            // create a broadcast notification for regular users that the lecture is now working.
             const lecture = await Lecture.findById(updated.lectureId).select('title chapterId thumbnailUrl thumbnail').lean();
             let chapterTitle = null;
             if (lecture && lecture.chapterId) {
               const chap = await Chapter.findById(lecture.chapterId).select('title').lean();
               chapterTitle = chap && chap.title;
             }
-            const notifTitle = `فيديو متاح الآن: ${updated.title}`;
-            await Notification.create({
-              title: notifTitle,
-              lectureId: updated.lectureId,
-              videoId: updated._id,
-              chapterId: lecture && lecture.chapterId,
-              thumbnailUrl: (lecture && (lecture.thumbnailUrl || lecture.thumbnail)) || undefined,
-              chapterTitle: chapterTitle || undefined,
-              recipients: [],
-              adminOnly: true,
-            });
+            // Check for any remaining admin 'video unavailable' notifications for this lecture
+            const remaining = await Notification.findOne({ lectureId: updated.lectureId, title: { $regex: '^فيديو غير متاح:' } });
+            if (!remaining) {
+              const notifTitle = lecture && lecture.title ? `المحاضرة أصبحت تعمل الآن: ${lecture.title}` : `المحاضرة أصبحت تعمل الآن`;
+              await Notification.create({
+                title: notifTitle,
+                lectureId: updated.lectureId,
+                chapterId: lecture && lecture.chapterId,
+                thumbnailUrl: (lecture && (lecture.thumbnailUrl || lecture.thumbnail)) || undefined,
+                chapterTitle: chapterTitle || undefined,
+                // empty recipients => broadcast; userOnly:true ensures admins do not receive it
+                recipients: [],
+                userOnly: true,
+              });
+            }
           } catch (e) {}
         }
       } catch (e) {

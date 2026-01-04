@@ -11,19 +11,19 @@ exports.getNotifications = async (req, res) => {
     // - If admin: include adminOnly notifications as well
     let query = null;
     if (!userId) {
-      // public: broadcast notifications that are not adminOnly
-      query = { recipients: { $size: 0 }, adminOnly: { $ne: true } };
+      // public: broadcast notifications that are not admin-only and not user-only
+      query = { recipients: { $size: 0 }, adminOnly: { $ne: true }, userOnly: { $ne: true } };
     } else if (isAdmin) {
-      // admin: receive everything addressed to them or admin-only or broadcasts
+      // admin: receive admin-only, explicit recipients, and broadcasts that are NOT user-only
       query = {
         $or: [
           { adminOnly: true },
-          { recipients: { $size: 0 } },
+          { recipients: { $size: 0 }, userOnly: { $ne: true } },
           { recipients: userId },
         ],
       };
     } else {
-      // authenticated non-admin
+      // authenticated non-admin: broadcasts (including userOnly) or explicit recipient
       query = {
         $or: [
           { recipients: { $size: 0 }, adminOnly: { $ne: true } },

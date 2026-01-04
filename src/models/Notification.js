@@ -18,6 +18,8 @@ const notificationSchema = new mongoose.Schema(
     readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     // whether this notification is intended only for admin users
     adminOnly: { type: Boolean, default: false },
+    // whether this notification should be shown only to regular (non-admin) authenticated users
+    userOnly: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
