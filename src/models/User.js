@@ -44,7 +44,7 @@ const userSchema = new mongoose.Schema(
         type: String,
         default: null,
       },
-      // Support multiple device ids for admins (allow up to 2)
+      // Support multiple device ids for admins (allow up to 3)
       deviceIds: {
         type: [String],
         default: [],

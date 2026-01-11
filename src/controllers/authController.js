@@ -41,7 +41,7 @@ exports.adminLogin = async (req, res) => {
 
     // Enforce single-browser for admin as well
 
-    // Support up to 2 admin devices: normalize legacy field to array
+    // Support up to 3 admin devices: normalize legacy field to array
     admin.deviceIds = Array.isArray(admin.deviceIds) && admin.deviceIds.length > 0
       ? admin.deviceIds
       : (admin.deviceId ? [admin.deviceId] : []);
@@ -51,7 +51,8 @@ exports.adminLogin = async (req, res) => {
 
     if (effectiveDeviceId) {
       if (!admin.deviceIds.includes(effectiveDeviceId)) {
-        if (admin.deviceIds.length >= 2) {
+        const ADMIN_DEVICE_LIMIT = Number(process.env.ADMIN_SESSION_LIMIT || '3');
+        if (admin.deviceIds.length >= ADMIN_DEVICE_LIMIT) {
           try {
             await Notification.create({
               title: 'محاولة دخول على حساب المدير من متصفح آخر',
@@ -60,7 +61,7 @@ exports.adminLogin = async (req, res) => {
           } catch (e) {
             // ignore notification errors
           }
-          return res.status(403).json({ message: 'Admin already logged in on two other browsers' });
+          return res.status(403).json({ message: `Admin already logged in on ${ADMIN_DEVICE_LIMIT - 1} other browsers` });
         }
         admin.deviceIds.push(effectiveDeviceId);
       }
@@ -71,8 +72,9 @@ exports.adminLogin = async (req, res) => {
     const newSessionToken = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
     admin.sessionTokens = admin.sessionTokens || [];
     admin.sessionTokens.push(newSessionToken);
-    // keep sessionTokens size capped (2)
-    if (admin.sessionTokens.length > 2) admin.sessionTokens = admin.sessionTokens.slice(-2);
+    // keep sessionTokens size capped (ADMIN_SESSION_LIMIT)
+    const ADMIN_SESSION_LIMIT = Number(process.env.ADMIN_SESSION_LIMIT || '3');
+    if (admin.sessionTokens.length > ADMIN_SESSION_LIMIT) admin.sessionTokens = admin.sessionTokens.slice(-ADMIN_SESSION_LIMIT);
 
     // keep legacy fields for backwards compat (first values)
     if (!admin.deviceId && admin.deviceIds.length > 0) admin.deviceId = admin.deviceIds[0];
