@@ -13,6 +13,7 @@
   "license": "ISC",
   "dependencies": {
   "axios": "^1.6.2",
+  "ffprobe-static": "^4.4.0",
   "jsonwebtoken": "^9.0.0",
   "@supabase/supabase-js": "^2.76.0",
   "cloudinary": "^2.8.0",

@@ -5,13 +5,14 @@ const fs = require('fs');
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    // Supabase not configured - operations depending on it will be disabled
-  }
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  // Server-side, use the service role key
-});
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    // Server-side, use the service role key
+  });
+} else {
+  // Supabase not configured - export stubs to avoid startup failures
+}
 
 // Upload a PDF buffer to the `pdfs` bucket and return public URL
 async function uploadPdf(filePath, destFileName) {
@@ -32,6 +33,7 @@ async function uploadPdf(filePath, destFileName) {
   const uniquePath = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
 
   // Helper to perform upload
+  if (!supabase) throw new Error('Supabase not configured');
   const doUpload = async () => {
     const { error: uploadError } = await supabase.storage
       .from(bucket)
@@ -51,12 +53,11 @@ async function uploadPdf(filePath, destFileName) {
     // If bucket not found, try to create it (requires service role key)
     const isBucketNotFound = err && (err.message?.toLowerCase().includes('bucket not found') || err.status === 400 || err.status === 404 || err.statusCode === '404');
     if (isBucketNotFound) {
+      if (!supabase) throw err;
       try {
         // Attempt to create bucket as public
         const { error: createErr } = await supabase.storage.createBucket(bucket, { public: true });
         if (createErr) {
-          // If bucket creation fails because it exists concurrently, attempt upload again
-          // but if it's a real error, surface it
           // Try upload once more
         }
         // Retry upload after attempting to create bucket
@@ -94,6 +95,7 @@ async function deletePdfByUrl(publicUrl) {
     const objectPath = decodeURIComponent(pathname.substring(idx + bucketMarker.length));
     if (!objectPath) return { ok: false, error: 'Empty object path' };
 
+    if (!supabase) return { ok: false, error: 'supabase not configured' };
     const { error } = await supabase.storage.from('pdfs').remove([objectPath]);
     if (error) {
       return { ok: false, error };

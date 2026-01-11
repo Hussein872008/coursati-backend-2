@@ -32,10 +32,22 @@ exports.getNotifications = async (req, res) => {
       };
     }
 
-    const notifications = await Notification.find(query).sort({ createdAt: -1 }).lean();
+    // transient DB errors can occur; do a small retry loop to smooth over brief network blips
+    let notifications = null;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        notifications = await Notification.find(query).sort({ createdAt: -1 }).lean();
+        break;
+      } catch (e) {
+        console.warn('getNotifications attempt', attempt, 'failed', e && (e.message || e));
+        if (attempt === maxAttempts) throw e;
+        await new Promise((r) => setTimeout(r, 200 * attempt));
+      }
+    }
 
     // mark read flag per notification for this user
-    const result = notifications.map((n) => ({
+    const result = (notifications || []).map((n) => ({
       ...n,
       isRead: Array.isArray(n.readBy) && n.readBy.some((r) => r.toString() === String(userId)),
     }));

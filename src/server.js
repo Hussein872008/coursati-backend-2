@@ -20,14 +20,11 @@ const notificationsRoutes = require('./routes/notificationsRoutes');
 const searchRoutes = require('./routes/searchRoutes');
 
 // Middleware
-const { authMiddleware, optionalAuth } = require('./middleware/auth');
+const { authMiddleware, optionalAuth, adminMiddleware } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const FRONTEND_URL = process.env.FRONTEND_URL;
-const NGROK_URL = 'https://shifty-gymnastically-wonda.ngrok-free.dev'; // رابط ngrok الحالي
-
-
 // =====================
 // CORS (STRICT)
 // =====================
@@ -35,7 +32,7 @@ app.use(
   cors({
     origin: (origin, callback) => {
       // Allow requests from frontend and ngrok URL
-      if (!origin || origin === FRONTEND_URL || origin === NGROK_URL) {
+      if (!origin || origin === FRONTEND_URL) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));
@@ -73,38 +70,65 @@ app.use(express.urlencoded({ extended: true }));
 // =====================
 
 
-mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => {
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('MongoDB connected');
-    }
+// Resilient MongoDB connection with retry on startup and helpful options
+const mongooseOptions = {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS) || 10000,
+  socketTimeoutMS: Number(process.env.MONGO_SOCKET_TIMEOUT_MS) || 45000,
+  connectTimeoutMS: Number(process.env.MONGO_CONNECT_TIMEOUT_MS) || 10000,
+  maxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE) || 20,
+  family: 4,
+};
 
-    // Start server only after DB connected to avoid buffering timeouts
-    app.listen(PORT, () => {
-      if (process.env.NODE_ENV !== 'production') {
-        console.log(`Server running on http://localhost:${PORT}`);
-      }
-      try {
-        // start periodic video validation scheduler (optional)
-        const videoController = require('./controllers/videoController');
-        if (videoController && typeof videoController.startValidationScheduler === 'function') {
-          videoController.startValidationScheduler();
-          if (process.env.NODE_ENV !== 'production') console.log('Video validation scheduler started');
-        }
-      } catch (e) {
-        console.error('Failed to start video validation scheduler', e && (e.message || e));
-      }
-    });
-  })
-  .catch((err) => {
-    console.error('MongoDB connection failed', err && err.message);
-    process.exit(1);
+function startServer() {
+  app.listen(PORT, () => {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`Server running on http://localhost:${PORT}`);
+    }
+    // Start the Video Status scheduler (lightweight in-process probe loop)
+    try {
+      const { startScheduler } = require('./services/videoStatusScheduler');
+      startScheduler();
+    } catch (e) {
+      console.warn('Failed to start video status scheduler', e && e.message);
+    }
   });
+}
+
+function connectWithRetry(retries = 0) {
+  return mongoose.connect(process.env.MONGODB_URI, mongooseOptions)
+    .then(() => {
+      console.log('MongoDB connected');
+      startServer();
+    })
+    .catch((err) => {
+      console.error('MongoDB connection failed', err && (err.message || err));
+      const wait = Math.min(30000, 1000 * Math.pow(2, retries));
+      console.log(`Retrying MongoDB connection in ${wait}ms`);
+      setTimeout(() => connectWithRetry(retries + 1), wait);
+    });
+}
+
+// Attach connection event listeners for visibility
+try {
+  const mongoose = require('mongoose');
+  mongoose.connection.on('connected', () => console.log('mongoose: connected'));
+  mongoose.connection.on('reconnected', () => console.log('mongoose: reconnected'));
+  mongoose.connection.on('disconnected', () => console.warn('mongoose: disconnected'));
+  mongoose.connection.on('close', () => console.warn('mongoose: connection closed'));
+  mongoose.connection.on('error', (e) => console.error('mongoose: connection error', e && (e.message || e)));
+} catch (e) {}
+
+// Start initial connect (with retries)
+connectWithRetry();
+// Note: server.listen is started from connectWithRetry once connected
+    
 
 // =====================
 // Public Routes
 // =====================
+
 app.use('/auth', authRoutes);
 app.use('/api/tree', treeRoutes);
 
@@ -121,6 +145,38 @@ app.use('/api/lectures', authMiddleware, lectureRoutes);
 app.use('/api/uploads', authMiddleware, uploadsRoutes);
 // Allow public access to GET notifications (broadcasts). Protect write endpoints separately.
 app.use('/api/notifications', optionalAuth, notificationsRoutes);
+
+// Server-Sent Events endpoint for notifications (public + authenticated users)
+try {
+  const { addClient, removeClient } = require('./utils/notificationBus');
+  app.get('/api/notifications/stream', optionalAuth, (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    // Allow the client to reconnect automatically
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders && res.flushHeaders();
+    const meta = { userId: req.user?._id, isAdmin: !!req.user?.isAdmin };
+    addClient(res, meta);
+    req.on('close', () => {
+      removeClient(res);
+    });
+  });
+} catch (e) {
+  console.warn('notifications stream not available', e && e.message);
+}
+
+// Graceful shutdown: ensure SSE clients are closed
+try {
+  const { closeAll } = require('./utils/notificationBus');
+  const shutdown = async () => {
+    try { closeAll(); } catch (e) {}
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.on('beforeExit', shutdown);
+} catch (e) {}
 
 // Some routes manage auth internally
 app.use('/api/pdfs', pdfRoutes);

@@ -131,3 +131,38 @@ exports.getTimeSeries = async (req, res) => {
 };
 
 module.exports = exports;
+
+// GET /api/admin/videos/status-summary
+exports.getVideoStatusSummary = async (req, res) => {
+  try {
+    // Global counts from videos collection
+    const total = await Video.countDocuments();
+    const working = await Video.countDocuments({ status: 'working' });
+    const broken = await Video.countDocuments({ status: 'broken' });
+    const health = total > 0 ? Math.round(((working / total) * 100) * 100) / 100 : 100;
+
+    // Produce a per-lecture list that includes all lectures (even if they have zero videos)
+    const pipeline = [
+      { $lookup: { from: 'videos', localField: '_id', foreignField: 'lectureId', as: 'videos' } },
+      { $project: {
+          lectureId: '$_id',
+          lectureTitle: '$title',
+          total: { $size: '$videos' },
+          working: { $size: { $filter: { input: '$videos', as: 'v', cond: { $eq: ['$$v.status', 'working'] } } } },
+          broken: { $size: { $filter: { input: '$videos', as: 'v', cond: { $eq: ['$$v.status', 'broken'] } } } },
+          videos: { $map: { input: '$videos', as: 'v', in: { _id: '$$v._id', title: '$$v.title', status: '$$v.status', duration: '$$v.duration' } } }
+        }
+      },
+      { $sort: { lectureTitle: 1 } },
+    ];
+
+    const perLecture = await Lecture.aggregate(pipeline).exec();
+
+    return res.json({ total, working, broken, health, perLecture });
+  } catch (err) {
+    console.error('getVideoStatusSummary error', err);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+// Note: historical probe metrics and per-video status histories removed to keep DB small.

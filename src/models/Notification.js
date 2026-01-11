@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const notificationSchema = new mongoose.Schema(
   {
     title: { type: String, required: true },
+    body: { type: String },
     lectureId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lecture' },
     videoId: { type: mongoose.Schema.Types.ObjectId, ref: 'Video' },
     chapterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Chapter' },
@@ -20,6 +21,8 @@ const notificationSchema = new mongoose.Schema(
     adminOnly: { type: Boolean, default: false },
     // whether this notification should be shown only to regular (non-admin) authenticated users
     userOnly: { type: Boolean, default: false },
+    // arbitrary metadata/payload
+    data: { type: mongoose.Schema.Types.Mixed },
   },
   { timestamps: true }
 );

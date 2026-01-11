@@ -55,9 +55,9 @@ const adminMiddleware = (req, res, next) => {
 
 // Optional auth: if `user-code` header present, set `req.user`; otherwise continue anonymously
 const optionalAuth = async (req, res, next) => {
-  const userCode = req.headers['user-code'];
+  const userCode = req.headers['user-code'] || req.query.userCode || req.query['user-code'];
   const deviceId = req.headers['device-id'] || req.headers['device_id'] || req.query.deviceId || req.query['device-id'];
-  const sessionToken = req.headers['session-token'] || req.headers['session_token'];
+  const sessionToken = req.headers['session-token'] || req.headers['session_token'] || req.query.sessionToken || req.query['session-token'];
   if (!userCode) {
     return next();
   }

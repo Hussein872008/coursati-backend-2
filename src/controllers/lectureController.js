@@ -82,6 +82,7 @@ exports.createLecture = async (req, res) => {
       // title shown on notification (keeps original short title)
       const notifTitle = `New lecture: ${lecture.title}`;
 
+      // Broadcast to regular users only (do not notify admins who created the lecture)
       await Notification.create({
         title: notifTitle,
         lectureId: lecture._id,
@@ -92,7 +93,8 @@ exports.createLecture = async (req, res) => {
         instructorTitle,
         materialTitle,
         thumbnailUrl: lecture.thumbnailUrl || null,
-        recipients: [], // empty = broadcast to all users
+        recipients: [], // empty = broadcast
+        userOnly: true, // only regular (non-admin) users should see this broadcast
       });
     } catch (e) {
       console.error('Failed to create notification for lecture:', e);

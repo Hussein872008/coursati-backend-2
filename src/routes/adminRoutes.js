@@ -13,30 +13,29 @@ router.get('/stats/timeseries', authMiddleware, adminMiddleware, adminController
 const videoController = require('../controllers/videoController');
 router.post('/lectures/:lectureId/videos', authMiddleware, adminMiddleware, videoController.createVideo);
 
+// Video status admin actions
+const videoStatusController = require('../controllers/videoStatusController');
+router.post('/videos/:videoId/recheck', authMiddleware, adminMiddleware, videoStatusController.recheckVideo);
+router.post('/lectures/:lectureId/recheck', authMiddleware, adminMiddleware, videoStatusController.recheckLecture);
+router.get('/lectures/:lectureId/notify-debug', authMiddleware, adminMiddleware, videoStatusController.getLectureNotifyDebug);
+// Admin: video status summary
+router.get('/videos/status-summary', authMiddleware, adminMiddleware, adminController.getVideoStatusSummary);
+
+// Removed video status history and probe metrics endpoints to reduce stored logs
+
+// Admin: (legacy validation endpoints removed)
+
+// Lecture health and validation endpoints removed; a new validator service will be added later.
+
 // Admin: get lecture by id (no subscription check) - used by admin UI redirects
 const lectureController = require('../controllers/lectureController');
 router.get('/lectures/:id', authMiddleware, adminMiddleware, lectureController.getLectureById);
 
-// Admin: validate or mirror segments for a video
-router.post('/videos/:videoId/validate', authMiddleware, adminMiddleware, videoController.validateVideo);
-// Admin: validate all videos (runs per-video validation sequentially)
-router.post('/videos/validate-all', authMiddleware, adminMiddleware, videoController.startValidateAllVideos);
-// Ensure the explicit `/latest` route is registered before the `:jobId` param
-router.get('/videos/validate-all/latest', authMiddleware, adminMiddleware, videoController.getLatestValidateJob);
-router.get('/videos/validate-all/:jobId', authMiddleware, adminMiddleware, videoController.getValidateJob);
+// Validation endpoints removed from admin API.
 // Admin: list all videos for dashboard
 router.get('/videos', authMiddleware, adminMiddleware, videoController.getAllVideosAdmin);
-// Pause/resume a validation job
-router.post('/videos/validate-all/:jobId/pause', authMiddleware, adminMiddleware, videoController.pauseValidateJob);
-router.post('/videos/validate-all/:jobId/resume', authMiddleware, adminMiddleware, videoController.resumeValidateJob);
-// Delete a validation job
-router.delete('/videos/validate-all/:jobId', authMiddleware, adminMiddleware, videoController.deleteValidateJob);
-// Revalidate a specific video and append result to job ("jump to failed")
-router.post('/videos/validate-all/:jobId/revalidate/:videoId', authMiddleware, adminMiddleware, videoController.revalidateJobVideo);
-// Stop a validation job
-router.post('/videos/validate-all/:jobId/stop', authMiddleware, adminMiddleware, videoController.stopValidateJob);
-// List recent validation jobs
-router.get('/videos/validate-all/jobs', authMiddleware, adminMiddleware, videoController.listValidateJobs);
+// All validation-job routes removed.
 // Admin: update video metadata
 router.put('/videos/:videoId', authMiddleware, adminMiddleware, videoController.updateVideo);
+// Admin: manual override removed — will be part of new validator UI/service.
 module.exports = router;
