@@ -86,6 +86,22 @@ function startServer() {
     if (process.env.NODE_ENV !== 'production') {
       console.log(`Server running on http://localhost:${PORT}`);
     }
+    // Verify system ffprobe is available before starting ffprobe-dependent services
+    try {
+      const { isFfprobeAvailable } = require('./utils/systemFFprobe');
+      if (!isFfprobeAvailable()) {
+        const msg = 'ffprobe not found in PATH. Install ffmpeg (provides ffprobe). On Alpine: apk add --no-cache ffmpeg';
+        if (process.env.NODE_ENV === 'production') {
+          console.error(msg);
+          process.exit(1);
+        } else {
+          console.warn(msg);
+        }
+      }
+    } catch (e) {
+      console.warn('Could not verify ffprobe availability', e && e.message);
+    }
+
     // Start the Video Status scheduler (lightweight in-process probe loop)
     try {
       const { startScheduler } = require('./services/videoStatusScheduler');
