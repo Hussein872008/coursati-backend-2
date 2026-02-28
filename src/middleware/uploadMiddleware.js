@@ -1,48 +1,41 @@
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const multer = require("multer");
+const { CloudinaryStorage } = require("multer-storage-cloudinary");
+const cloudinary = require("../config/cloudinary");
 
-// إنشء مجلد uploads إذا لم يكن موجوداً
-const uploadDir = path.join(__dirname, '../../uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// تكوين التخزين
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // تخزين في مجلد uploads مؤقتاً قبل الرفع إلى Cloudinary
-    cb(null, uploadDir);
+const storage = new CloudinaryStorage({
+  cloudinary,
+  params: async (req, file) => {
+    return {
+      folder: "ecommerce_uploads",
+      resource_type: "auto", // يدعم صور و PDF
+      allowed_formats: ["jpg", "png", "gif", "webp", "pdf"],
+    };
   },
-  filename: (req, file, cb) => {
-    // اسم فريد للملف
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
 });
 
-
-// تصفية الملفات
 const fileFilter = (req, file, cb) => {
-  // أنواع الملفات المسموحة (videos removed - video functionality has been removed from the project)
-  const imageTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-  const pdfTypes = ['application/pdf'];
+  const allowedMimeTypes = [
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "application/pdf",
+  ];
 
-  if (imageTypes.includes(file.mimetype) || 
-      pdfTypes.includes(file.mimetype)) {
+  if (allowedMimeTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error('نوع الملف غير مدعوم'), false);
+    cb(new Error("نوع الملف غير مدعوم"), false);
   }
 };
 
-// إعدادات multer
 const upload = multer({
-  storage: storage,
-  fileFilter: fileFilter,
+  storage,
   limits: {
-    fileSize: 200 * 1024 * 1024 // 200MB
-  }
+    fileSize: 20 * 1024 * 1024, // 20MB
+    files: 6,
+  },
+  fileFilter,
 });
 
 module.exports = upload;
